@@ -17,6 +17,8 @@ import inspect
 import itertools
 import json
 import logging
+
+import cftime
 import numpy as np
 import operator
 import pandas as pd
@@ -36,8 +38,8 @@ from google.api_core.exceptions import BadRequest
 from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
 from xarray.core.utils import ensure_us_time_resolution
+import math
 
-from .sinks import DEFAULT_COORD_KEYS
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -47,6 +49,7 @@ CANARY_RECORD = {'foo': 'bar'}
 CANARY_RECORD_FILE_NAME = 'canary_record.json'
 CANARY_OUTPUT_TABLE_SUFFIX = '_anthromet_canary_table'
 CANARY_TABLE_SCHEMA = [bigquery.SchemaField('name', 'STRING', mode='NULLABLE')]
+DEFAULT_COORD_KEYS = frozenset(('latitude', 'time', 'step', 'valid_time', 'longitude', 'number'))
 
 
 def to_json_serializable_type(value: t.Any) -> t.Any:
@@ -61,7 +64,8 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     elif type(value) == np.ndarray:
         # Will return a scaler if array is of size 1, else will return a list.
         return value.tolist()
-    elif type(value) == datetime.datetime or type(value) == str or type(value) == np.datetime64:
+    #CHANGED this for rasm.nc cftime._cftime.DatetimeNoLeap
+    elif type(value) == datetime.datetime or type(value) == str or type(value) == np.datetime64 or hasattr(value, 'isoformat'):
         # Assume strings are ISO format timestamps...
         try:
             value = datetime.datetime.fromisoformat(value)
@@ -77,7 +81,8 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
                 pass
 
         # We use a string timestamp representation.
-        if value.tzname():
+        #CHANGED this for rasm.nc cftime._cftime.DatetimeNoLeap
+        if hasattr(value, 'tzname') or hasattr(value, 'tzinfo'):
             return value.isoformat()
 
         # We assume here that naive timestamps are in UTC timezone.
@@ -97,6 +102,15 @@ def _check_for_coords_vars(ds_data_var: str, target_var: str) -> bool:
     specified by the user."""
     return ds_data_var.endswith('_'+target_var) or ds_data_var.startswith(target_var+'_')
 
+def convert_size(size_bytes):
+    if size_bytes == 0:
+        return "0B"
+    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
+    i = int(math.floor(math.log(size_bytes, 1024)))
+    # p = math.pow(1024, i)
+    p = (1 << i*10)
+    s = round(size_bytes / p, 2)
+    return "%s %s" % (s, size_name[i])
 
 def _only_target_coordinate_vars(ds: xr.Dataset, data_vars: t.List[str]) -> t.List[str]:
     """If the user specifies target fields in the dataset, get all the matching coords & data vars."""
@@ -114,13 +128,29 @@ def _only_target_coordinate_vars(ds: xr.Dataset, data_vars: t.List[str]) -> t.Li
 
     return keep_coords_vars
 
+def get_iterator_minimal(ds, start, stop):
+    all_iterables = []
+    start_offset = None
+    start_stop_range = stop - start
+    previous = 0
+    print(f'inside start {start}')
+    print(f'inside stop {stop}')
+    for v in ds.keys():
+        current = math.prod(ds[v].shape) + previous
+        if max(start, previous) <= min(current, stop):
+            if start_offset is None:
+                start_offset = previous
+            all_iterables.append(itertools.product((v,), itertools.product(*[range(s) for s in ds[v].shape])))
+        if (previous := current) > stop:
+            break
+    return itertools.islice(itertools.chain.from_iterable(all_iterables), start-start_offset, (start-start_offset)+start_stop_range)
 
 def _only_target_vars(ds: xr.Dataset, data_vars: t.Optional[t.List[str]] = None) -> xr.Dataset:
     """If the user specifies target fields in the dataset, create a schema only from those fields."""
 
     # If there are no restrictions on data vars, include the whole dataset.
     if not data_vars:
-        logger.info(f'target data_vars empty; using whole dataset; size: {ds.nbytes}')
+        logger.info(f'target data_vars empty; using whole dataset; size: {convert_size(ds.nbytes)}')
         return ds
 
     if not ds.attrs['is_normalized']:
@@ -145,7 +175,7 @@ def _only_target_vars(ds: xr.Dataset, data_vars: t.Optional[t.List[str]] = None)
 
         dropped_ds = ds.drop_vars(drop_vars)
 
-    logger.info(f'target-only dataset size: {dropped_ds.nbytes}')
+    logger.info(f'target-only dataset size: {convert_size(dropped_ds.nbytes)}')
 
     return dropped_ds
 

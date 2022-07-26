@@ -19,14 +19,50 @@ import typing as t
 
 import apache_beam as beam
 from apache_beam.io.filesystems import FileSystems
-
+from apache_beam.io import fileio
 from .bq import ToBigQuery
+from .bq import WindowPerFile
 from .regrid import Regrid
 from .ee import ToEarthEngine
 from .streaming import GroupMessagesByFixedWindows, ParsePaths
 
+try:
+  import colored_traceback
+  import colorlog
+  from pygments.styles import get_style_by_name
+  material_style = get_style_by_name('material')
+  formatter = colorlog.ColoredFormatter(
+      "%(log_color)s%(levelname)-8s%(reset)s %(message_log_color)s%(message)s",
+      datefmt=None,
+      reset=True,
+      log_colors={
+          'DEBUG':    'cyan',
+          'INFO':     'green',
+          'WARNING':  'yellow',
+          'ERROR':    'red',
+          'CRITICAL': 'red,bg_white',
+      },
+      secondary_log_colors={
+          'message': {
+              'DEBUG':    'cyan',
+              'INFO':     'green',
+              'WARNING':  'yellow',
+              'ERROR':    'red',
+              'CRITICAL': 'red,bg_white',
+          }
+      },
+      style='%'
+  )
 
-logger = logging.getLogger(__name__)
+  handler = colorlog.StreamHandler()
+  handler.setFormatter(formatter)
+  handler.setLevel(logging.INFO)
+  logger = colorlog.getLogger(__name__)
+  logger.addHandler(handler)
+  logging.getLogger("apache_beam").addHandler(handler)
+  colored_traceback.add_hook(always=True, style='material')
+except ImportError:
+  logger = logging.getLogger(__name__)
 
 
 def configure_logger(verbosity: int) -> None:
@@ -36,15 +72,14 @@ def configure_logger(verbosity: int) -> None:
     logger.setLevel(level)
 
 
-def pattern_to_uris(match_pattern: str) -> t.Iterable[str]:
-    for match in FileSystems().match([match_pattern]):
-        yield from [x.path for x in match.metadata_list]
-
+# def pattern_to_uris(match_pattern: str) -> t.Iterable[str]:
+#     for match in FileSystems().match([match_pattern]):
+#         yield from [x.path for x in match.metadata_list]
 
 def pipeline(known_args: argparse.Namespace, pipeline_args: t.List[str]) -> None:
-    all_uris = list(pattern_to_uris(known_args.uris))
-    if not all_uris:
-        raise FileNotFoundError(f"File prefix '{known_args.uris}' matched no objects")
+    # all_uris = list(pattern_to_uris(known_args.uris))
+    # if not all_uris:
+    #     raise FileNotFoundError(f"File prefix '{known_args.uris}' matched no objects")
 
     with beam.Pipeline(argv=pipeline_args) as p:
         if known_args.topic:
@@ -57,10 +92,13 @@ def pipeline(known_args: argparse.Namespace, pipeline_args: t.List[str]) -> None
                     | 'ParsePaths' >> beam.ParDo(ParsePaths(known_args.uris))
             )
         else:
-            paths = p | 'Create' >> beam.Create(all_uris)
+            # paths = p | 'Create' >> beam.Create(known_args.uris)
+            paths = (p | 'Match Files' >> fileio.MatchFiles(known_args.uris))
 
         if known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq':
-            paths | "MoveToBigQuery" >> ToBigQuery.from_kwargs(example_uri=next(iter(all_uris)), **vars(known_args))
+            (paths | "MoveToBigQuery" >> ToBigQuery.from_kwargs(
+                **vars(known_args))
+             )
         elif known_args.subcommand == 'regrid' or known_args.subcommand == 'rg':
             paths | "Regrid" >> Regrid.from_kwargs(**vars(known_args))
         elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':

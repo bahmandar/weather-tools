@@ -17,36 +17,84 @@ import datetime
 import json
 import logging
 import os
+
+# TYPING VS TYPEHINTS?
 import typing as t
 from pprint import pformat
 
+
+
 import apache_beam as beam
-import geojson
-import more_itertools as mitertools
-import numpy as np
-import xarray as xr
+
+
 from apache_beam.io import WriteToBigQuery, BigQueryDisposition
 from apache_beam.options.pipeline_options import PipelineOptions
 from google.cloud import bigquery
 from xarray.core.utils import ensure_us_time_resolution
-
-from .sinks import ToDataSink, open_dataset
+import pathlib
+from .sinks import ToDataSink, open_dataset, open_dataset_modified
+from apache_beam.typehints import Iterable
+from apache_beam.typehints import Tuple
+from apache_beam.io import fileio
+import math
+from apache_beam.transforms import window
+from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
+from apache_beam.coders.coders import VarIntCoder
+import time
 from .util import (
     to_json_serializable_type,
     validate_region,
     _only_target_vars,
-    get_coordinates
+    get_coordinates,
+    get_iterator_minimal
+)
+from .transform_utils import (
+    FanOut,
+    WindowPerFile,
+    ProcessXArray,
+    PrepareFiles
 )
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-DEFAULT_IMPORT_TIME = datetime.datetime.utcfromtimestamp(0).replace(tzinfo=datetime.timezone.utc).isoformat()
-DATA_IMPORT_TIME_COLUMN = 'data_import_time'
-DATA_URI_COLUMN = 'data_uri'
-DATA_FIRST_STEP = 'data_first_step'
-GEO_POINT_COLUMN = 'geo_point'
-LATITUDE_RANGE = (-90, 90)
+# DEFAULT_IMPORT_TIME = datetime.datetime.utcfromtimestamp(0).replace(tzinfo=datetime.timezone.utc).isoformat()
+# DATA_IMPORT_TIME_COLUMN = 'data_import_time'
+# DATA_URI_COLUMN = 'data_uri'
+# DATA_FIRST_STEP = 'data_first_step'
+# GEO_POINT_COLUMN = 'geometry'
+# GEO_TYPE = 'type'
+# LATITUDE_RANGE = (-90, 90)
+
+
+
+
+
+def merge_dicts(element):
+    row_data = element[0]
+    for item in element[1]:
+        row_data.update(item)
+
+
+
+def print_row(element):
+    print('asssd')
+    print(element)
+
+    return element[1]
+
+def format_records(element) -> t.Dict:
+    # output_dict = {"properties": {}}
+    output_dict = {}
+    for item in [i for sub in element for i in sub]:
+        output_dict.update(item)
+        # if next(iter(item)) in ('geometry', 'type'):
+        #     output_dict.update(item)
+        # else:
+        #     output_dict['properties'].update(item)
+
+    return output_dict
+
 
 
 @dataclasses.dataclass
@@ -64,7 +112,7 @@ class ToBigQuery(ToDataSink):
     `these docs`_ for more.
 
     Attributes:
-        example_uri: URI to a weather data file, used to infer the BigQuery schema.
+        # example_uri: URI to a weather data file, used to infer the BigQuery schema.
         output_table: The destination for where data should be written in BigQuery
         variables: Target variables (or coordinates) for the BigQuery schema. By default,
           all data variables will be imported as columns.
@@ -87,7 +135,7 @@ class ToBigQuery(ToDataSink):
 
     .. _these docs: https://beam.apache.org/documentation/io/built-in/google-bigquery/#setting-the-insertion-method
     """
-    example_uri: str
+    # example_uri: str
     output_table: str
     variables: t.List[str]
     area: t.Tuple[int, int, int, int]
@@ -99,16 +147,19 @@ class ToBigQuery(ToDataSink):
     skip_region_validation: bool
     disable_grib_schema_normalization: bool
     coordinate_chunk_size: int = 10_000
+    disable_local_save: bool = False
+    table_schema: t.List[bigquery.SchemaField] = None
+    project: str = None
 
     @classmethod
     def add_parser_arguments(cls, subparser: argparse.ArgumentParser):
         subparser.add_argument('-o', '--output_table', type=str, required=True,
                                help="Full name of destination BigQuery table (<project>.<dataset>.<table>). Table "
                                     "will be created if it doesn't exist.")
-        subparser.add_argument('-v', '--variables', metavar='variables', type=str, nargs='+', default=list(),
+        subparser.add_argument('-v', '--variables', metavar='variables', type=str, nargs='+', default=None,
                                help='Target variables (or coordinates) for the BigQuery schema. Default: will import '
                                     'all data variables as columns.')
-        subparser.add_argument('-a', '--area', metavar='area', type=int, nargs='+', default=list(),
+        subparser.add_argument('-a', '--area', metavar='area', type=int, nargs='+', default=None,
                                help='Target area in [N, W, S, E]. Default: Will include all available area.')
         subparser.add_argument('--import_time', type=str, default=datetime.datetime.utcnow().isoformat(),
                                help=("When writing data to BigQuery, record that data import occurred at this "
@@ -125,11 +176,13 @@ class ToBigQuery(ToDataSink):
                                     'Applicable only for tif files.')
         subparser.add_argument('-s', '--skip-region-validation', action='store_true', default=False,
                                help='Skip validation of regions for data migration. Default: off')
-        subparser.add_argument('--coordinate_chunk_size', type=int, default=10_000,
+        subparser.add_argument('--coordinate_chunk_size', type=int, default=500_000,
                                help='The size of the chunk of coordinates used for extracting vector data into '
                                     'BigQuery. Used to tune parallel uploads.')
         subparser.add_argument('--disable_grib_schema_normalization', action='store_true', default=False,
                                help="To disable grib's schema normalization. Default: off")
+        subparser.add_argument('--disable_local_save', action='store_true', default=False,
+                               help="To disable local save to vm worker Default: off")
 
     @classmethod
     def validate_arguments(cls, known_args: argparse.Namespace, pipeline_args: t.List[str]) -> None:
@@ -154,193 +207,80 @@ class ToBigQuery(ToDataSink):
                             region=pipeline_options_dict.get('region'))
             logger.info('Region validation completed successfully.')
 
-    def __post_init__(self):
-        """Initializes Sink by creating a BigQuery table based on user input."""
-        with open_dataset(self.example_uri, self.xarray_open_dataset_kwargs, True,
-                          self.disable_grib_schema_normalization, self.tif_metadata_for_datetime) as open_ds:
-            # Define table from user input
-            if self.variables and not self.infer_schema and not open_ds.attrs['is_normalized']:
-                logger.info('Creating schema from input variables.')
-                table_schema = to_table_schema(
-                    [('latitude', 'FLOAT64'), ('longitude', 'FLOAT64'), ('time', 'TIMESTAMP')] +
-                    [(var, 'FLOAT64') for var in self.variables]
-                )
-            else:
-                logger.info('Inferring schema from data.')
-                ds: xr.Dataset = _only_target_vars(open_ds, self.variables)
-                table_schema = dataset_to_table_schema(ds)
+    def set_elment_table(self, element, table):
+        return element._replace(table=table)
 
-        if self.dry_run:
+    def get_schema(self, sets):
+        table_schema = []
+        elements = sets[1]
+        for item in elements:
+            item_schema_names = [x.name for x in table_schema]
+            for schema_field in item.schema:
+                if schema_field.name not in item_schema_names:
+                    table_schema.append(schema_field)
+        if elements[0].dry_run:
             logger.debug('Created the BigQuery table with schema...')
-            logger.debug(f'\n{pformat(table_schema)}')
-            return
+            table = None
+        else:
+            # Create the table in BigQuery
+            try:
+                # table_id = "your-project.your_dataset.your_table_name"
+                table = bigquery.Table(self.output_table.replace(":","."), schema=table_schema)
+                table = bigquery.Client().create_table(table, exists_ok=True)
+            except Exception as e:
+                logger.error(f'Unable to create table in BigQuery: {e}')
+                raise
+        elements = list(map(lambda n: self.set_elment_table(n, table=table), elements))
 
-        # Create the table in BigQuery
-        try:
-            table = bigquery.Table(self.output_table, schema=table_schema)
-            self.table = bigquery.Client().create_table(table, exists_ok=True)
-        except Exception as e:
-            logger.error(f'Unable to create table in BigQuery: {e}')
-            raise
+
+        return elements
+
+
+
+
+    def __post_init__(self):
+        """Initializes Sink by creating a BigQuery tzable based on user input."""
+        logging.info('Post INIT')
+
 
     def expand(self, paths):
-        """Extract rows of variables from data paths into a BigQuery table."""
-        extracted_rows = (
-                paths
-                | 'PrepareCoordinates' >> beam.FlatMap(
-                    prepare_coordinates,
-                    coordinate_chunk_size=self.coordinate_chunk_size,
-                    area=self.area,
-                    open_dataset_kwargs=self.xarray_open_dataset_kwargs,
-                    variables=self.variables,
-                    disable_in_memory_copy=self.disable_in_memory_copy,
-                    disable_grib_schema_normalization=self.disable_grib_schema_normalization,
-                    tif_metadata_for_datetime=self.tif_metadata_for_datetime)
-                | beam.Reshuffle()
-                | 'ExtractRows' >> beam.FlatMapTuple(
-                    extract_rows,
-                    variables=self.variables,
-                    import_time=self.import_time,
-                    open_dataset_kwargs=self.xarray_open_dataset_kwargs,
-                    disable_in_memory_copy=self.disable_in_memory_copy,
-                    disable_grib_schema_normalization=self.disable_grib_schema_normalization,
-                    tif_metadata_for_datetime=self.tif_metadata_for_datetime)
-        )
 
+        """Extract rows of variables from data paths into a BigQuery table."""
+
+        extracted_rows = (
+            paths
+            | 'Read Matches' >> fileio.ReadMatches()
+            | 'Prepare Files' >> beam.ParDo(PrepareFiles(*(dataclasses.asdict(self).get(k.name) for k in dataclasses.fields(PrepareFiles))))
+            | 'Get common items' >> beam.GroupByKey()
+            | 'Create Schema' >> beam.Map(self.get_schema)
+            | 'Fan out' >> beam.ParDo(FanOut())
+            | 'Add Window Per File' >> WindowPerFile()
+            | 'Process Files' >> beam.ParDo(ProcessXArray())
+            | 'Group by Key' >> beam.GroupByKey()
+            | 'Format Records' >> beam.Map(format_records)
+
+
+        )
+        #Issue with project??
         if not self.dry_run:
             (
                     extracted_rows
                     | 'WriteToBigQuery' >> WriteToBigQuery(
-                        project=self.table.project,
-                        dataset=self.table.dataset_id,
-                        table=self.table.table_id,
+                        project=self.project,
+                        table=self.output_table,
+                        method=beam.io.WriteToBigQuery.Method.FILE_LOADS,
                         write_disposition=BigQueryDisposition.WRITE_APPEND,
                         create_disposition=BigQueryDisposition.CREATE_NEVER)
             )
         else:
-            (
-                    extracted_rows
-                    | 'Log Extracted Rows' >> beam.Map(logger.debug)
-            )
+            pass
+            # (
+            #         extracted_rows
+            #         | 'Log Extracted Rows' >> beam.Map(logger.debug)
+            # )
 
 
-def map_dtype_to_sql_type(var_type: np.dtype) -> str:
-    """Maps a np.dtype to a suitable BigQuery column type."""
-    if var_type in {np.dtype('float64'), np.dtype('float32'), np.dtype('timedelta64[ns]')}:
-        return 'FLOAT64'
-    elif var_type in {np.dtype('<M8[ns]')}:
-        return 'TIMESTAMP'
-    elif var_type in {np.dtype('int8'), np.dtype('int16'), np.dtype('int32'), np.dtype('int64')}:
-        return 'INT64'
-    raise ValueError(f"Unknown mapping from '{var_type}' to SQL type")
 
 
-def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery.SchemaField]:
-    """Returns a BigQuery table schema able to store the data in 'ds'."""
-    # Get the columns and data types for all variables in the dataframe
-    columns = [
-        (str(col), map_dtype_to_sql_type(ds.variables[col].dtype))
-        for col in ds.variables.keys() if ds.variables[col].size != 0
-    ]
-
-    return to_table_schema(columns)
 
 
-def to_table_schema(columns: t.List[t.Tuple[str, str]]) -> t.List[bigquery.SchemaField]:
-    # Fields are all Nullable because data may have NANs. We treat these as null.
-    fields = [
-        bigquery.SchemaField(column, var_type, mode='NULLABLE')
-        for column, var_type in columns
-    ]
-
-    # Add an extra columns for recording import metadata.
-    fields.append(bigquery.SchemaField(DATA_IMPORT_TIME_COLUMN, 'TIMESTAMP', mode='NULLABLE'))
-    fields.append(bigquery.SchemaField(DATA_URI_COLUMN, 'STRING', mode='NULLABLE'))
-    fields.append(bigquery.SchemaField(DATA_FIRST_STEP, 'TIMESTAMP', mode='NULLABLE'))
-    fields.append(bigquery.SchemaField(GEO_POINT_COLUMN, 'GEOGRAPHY', mode='NULLABLE'))
-
-    return fields
-
-
-def fetch_geo_point(lat: float, long: float) -> str:
-    """Calculates a geography point from an input latitude and longitude."""
-    if lat > LATITUDE_RANGE[1] or lat < LATITUDE_RANGE[0]:
-        raise ValueError(f"Invalid latitude value '{lat}'")
-    long = ((long + 180) % 360) - 180
-    point = geojson.dumps(geojson.Point((long, lat)))
-    return point
-
-
-def prepare_coordinates(
-        uri: str, *,
-        coordinate_chunk_size: int,
-        variables: t.Optional[t.List[str]] = None,
-        area: t.Optional[t.List[int]] = None,
-        open_dataset_kwargs: t.Optional[t.Dict] = None,
-        disable_in_memory_copy: bool = False,
-        disable_grib_schema_normalization: bool = False,
-        tif_metadata_for_datetime: t.Optional[str] = None) -> t.Iterator[t.Tuple[str, t.List[t.Dict]]]:
-    """Open the dataset, filter by area, and prepare chunks of coordinates for parallel ingestion into BigQuery."""
-    logger.info(f'Preparing coordinates for: {uri!r}.')
-
-    with open_dataset(uri, open_dataset_kwargs, disable_in_memory_copy, disable_grib_schema_normalization,
-                      tif_metadata_for_datetime) as ds:
-        data_ds: xr.Dataset = _only_target_vars(ds, variables)
-        if area:
-            n, w, s, e = area
-            data_ds = data_ds.sel(latitude=slice(n, s), longitude=slice(w, e))
-            logger.info(f'Data filtered by area, size: {data_ds.nbytes}')
-
-        for chunk in mitertools.ichunked(get_coordinates(data_ds, uri), coordinate_chunk_size):
-            yield uri, list(chunk)
-
-
-def extract_rows(uri: str,
-                 coordinates: t.List[t.Dict],
-                 variables: t.Optional[t.List[str]] = None,
-                 import_time: t.Optional[str] = DEFAULT_IMPORT_TIME,
-                 open_dataset_kwargs: t.Optional[t.Dict] = None,
-                 disable_in_memory_copy: bool = False,
-                 disable_grib_schema_normalization: bool = False,
-                 tif_metadata_for_datetime: t.Optional[str] = None) -> t.Iterator[t.Dict]:
-    """Reads an asset and coordinates, then yields its rows as a mapping of column names to values."""
-    logger.info(f'Extracting rows for [{coordinates[0]!r}...{coordinates[-1]!r}] of {uri!r}.')
-
-    # Re-calculate import time for streaming extractions.
-    if not import_time:
-        import_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
-
-    with open_dataset(uri, open_dataset_kwargs, disable_in_memory_copy, disable_grib_schema_normalization,
-                      tif_metadata_for_datetime) as ds:
-        data_ds: xr.Dataset = _only_target_vars(ds, variables)
-
-        first_ts_raw = data_ds.time[0].values if isinstance(data_ds.time.values, np.ndarray) else data_ds.time.values
-        first_time_step = to_json_serializable_type(first_ts_raw)
-
-        for it in coordinates:
-            # Use those index values to select a Dataset containing one row of data.
-            row_ds = data_ds.loc[it]
-
-            # Create a Name-Value map for data columns. Result looks like:
-            # {'d': -2.0187, 'cc': 0.007812, 'z': 50049.8, 'rr': None}
-            row = {n: to_json_serializable_type(ensure_us_time_resolution(v.values))
-                   for n, v in row_ds.data_vars.items()}
-
-            # Add indexed coordinates.
-            row.update(it)
-            # Add un-indexed coordinates.
-            for c in row_ds.coords:
-                if c not in it and (not variables or c in variables):
-                    row[c] = to_json_serializable_type(ensure_us_time_resolution(row_ds[c].values))
-
-            # Add import metadata.
-            row[DATA_IMPORT_TIME_COLUMN] = import_time
-            row[DATA_URI_COLUMN] = uri
-            row[DATA_FIRST_STEP] = first_time_step
-            row[GEO_POINT_COLUMN] = fetch_geo_point(row['latitude'], row['longitude'])
-
-            # 'row' ends up looking like:
-            # {'latitude': 88.0, 'longitude': 2.0, 'time': '2015-01-01 06:00:00', 'd': -2.0187, 'cc': 0.007812,
-            #  'z': 50049.8, 'data_import_time': '2020-12-05 00:12:02.424573 UTC', ...}
-            beam.metrics.Metrics.counter('Success', 'ExtractRows').inc()
-            yield row

@@ -13,7 +13,7 @@
 # limitations under the License.
 import argparse
 import dataclasses
-import ee
+# import ee
 import json
 import logging
 import os
