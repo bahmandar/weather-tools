@@ -39,6 +39,8 @@ from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
 from xarray.core.utils import ensure_us_time_resolution
 import math
+import socket
+HOSTNAME = socket.gethostname()
 
 
 logger = logging.getLogger(__name__)
@@ -56,7 +58,6 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     """Returns the value with a type serializable to JSON"""
     # Note: The order of processing is significant.
     logger.debug('Serializing to JSON')
-
     if pd.isna(value) or value is None:
         return None
     elif np.issubdtype(type(value), np.floating):
@@ -64,7 +65,7 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     elif type(value) == np.ndarray:
         # Will return a scaler if array is of size 1, else will return a list.
         return value.tolist()
-    #CHANGED this for rasm.nc cftime._cftime.DatetimeNoLeap
+    # NOTE(bahmandar): this for rasm.nc cftime._cftime.DatetimeNoLeap
     elif type(value) == datetime.datetime or type(value) == str or type(value) == np.datetime64 or hasattr(value, 'isoformat'):
         # Assume strings are ISO format timestamps...
         try:
@@ -81,7 +82,7 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
                 pass
 
         # We use a string timestamp representation.
-        #CHANGED this for rasm.nc cftime._cftime.DatetimeNoLeap
+        # NOTE(bahmandar): this for rasm.nc cftime._cftime.DatetimeNoLeap
         if hasattr(value, 'tzname') or hasattr(value, 'tzinfo'):
             return value.isoformat()
 
@@ -102,15 +103,16 @@ def _check_for_coords_vars(ds_data_var: str, target_var: str) -> bool:
     specified by the user."""
     return ds_data_var.endswith('_'+target_var) or ds_data_var.startswith(target_var+'_')
 
+# NOTE(bahmandar): add this just to print nicer
 def convert_size(size_bytes):
     if size_bytes == 0:
-        return "0B"
-    size_name = ("B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB")
+        return '0B'
+    size_name = ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB', 'EiB', 'ZiB', 'YiB')
     i = int(math.floor(math.log(size_bytes, 1024)))
     # p = math.pow(1024, i)
     p = (1 << i*10)
     s = round(size_bytes / p, 2)
-    return "%s %s" % (s, size_name[i])
+    return '%s %s' % (s, size_name[i])
 
 def _only_target_coordinate_vars(ds: xr.Dataset, data_vars: t.List[str]) -> t.List[str]:
     """If the user specifies target fields in the dataset, get all the matching coords & data vars."""
@@ -128,22 +130,32 @@ def _only_target_coordinate_vars(ds: xr.Dataset, data_vars: t.List[str]) -> t.Li
 
     return keep_coords_vars
 
-def get_iterator_minimal(ds, start, stop):
-    all_iterables = []
-    start_offset = None
-    start_stop_range = stop - start
-    previous = 0
-    print(f'inside start {start}')
-    print(f'inside stop {stop}')
-    for v in ds.keys():
-        current = math.prod(ds[v].shape) + previous
-        if max(start, previous) <= min(current, stop):
-            if start_offset is None:
-                start_offset = previous
-            all_iterables.append(itertools.product((v,), itertools.product(*[range(s) for s in ds[v].shape])))
-        if (previous := current) > stop:
-            break
-    return itertools.islice(itertools.chain.from_iterable(all_iterables), start-start_offset, (start-start_offset)+start_stop_range)
+# NOTE(bahmandar): this was used when doing each variable separately because some
+# variables won't have the all the dimensions
+# def get_iterator_minimal(shapes, start, stop):
+#     all_iterables = []
+#     start_offset = None
+#     start_stop_range = stop - start
+#     previous = 0
+#     for k, v in shapes.items():
+#         current = math.prod(v) + previous
+#         if max(start, previous) <= min(current, stop):
+#             if start_offset is None:
+#                 start_offset = previous
+#             all_iterables.append(itertools.product((k,), itertools.product(*[range(s) for s in v])))
+#         if (previous := current) > stop:
+#             break
+#     return itertools.islice(itertools.chain.from_iterable(all_iterables), start-start_offset, (start-start_offset)+start_stop_range)
+
+
+
+def get_iterator_minimal(sizes: t.Mapping[t.Hashable, int],
+                         start: int,
+                         stop: int) -> t.List[t.Dict]:
+    keys, values = zip(*sizes.items())
+    result = [dict(zip(keys, p)) for p in itertools.islice(itertools.product(*[range(s) for s in values]), start, stop)]
+    return result
+
 
 def _only_target_vars(ds: xr.Dataset, data_vars: t.Optional[t.List[str]] = None) -> xr.Dataset:
     """If the user specifies target fields in the dataset, create a schema only from those fields."""
@@ -247,7 +259,7 @@ def validate_region(output_table: t.Optional[str] = None,
     """Validates non-compatible regions scenarios by performing sanity check."""
     if not region and not temp_location:
         raise ValueError('Invalid GCS location: None.')
-
+    output_table = output_table.replace(":", ".")
     bucket_region = region
     storage_client = storage.Client()
     canary_bucket_name = CANARY_BUCKET_NAME + str(uuid.uuid4())
@@ -259,7 +271,7 @@ def validate_region(output_table: t.Optional[str] = None,
     original_sigtstp_handler = signal.getsignal(signal.SIGTSTP)
     signal.signal(signal.SIGINT, do_bucket_cleanup)
     signal.signal(signal.SIGTSTP, do_bucket_cleanup)
-
+    print(output_table)
     if output_table:
         table_region = None
         bigquery_client = bigquery.Client()

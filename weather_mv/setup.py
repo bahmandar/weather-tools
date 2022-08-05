@@ -31,14 +31,20 @@ base_requirements = [
     "dataclasses",
     "numpy",
     "pandas",
+    "google-api-python-client",
+    "google-api-core",
     "xarray",
+    "google-cloud-storage==2.2.1",
     "cfgrib",
     "netcdf4",
     "geojson",
     "more-itertools",
     "simplejson",
+    "fsspec",
     "rioxarray",
-    "metview",
+    "cloudpickle",
+    "codetiming",
+    # "metview",
     "rasterio",
     "earthengine-api>=0.1.263",
     "pyproj",  # requires separate binary installation!
@@ -87,13 +93,9 @@ class build(_build):  # pylint: disable=invalid-name
 """Install the ecCodes and MetView packages from ECMWF."""
 CUSTOM_COMMANDS = [
     cmd.split() for cmd in [
-        'sudo add-apt-repository ppa:ubuntugis/ppa,'
         'apt-get update',
         'apt-get --assume-yes install libeccodes-dev',
-        'apt-get --assume-yes install gdal-bin',
-        'apt-get --assume-yes install libgdal-dev',
-        'export CPLUS_INCLUDE_PATH=/usr/include/gdal',
-        'export C_INCLUDE_PATH=/usr/include/gdal',
+        'conda install gdal -c conda-forge -y',
         'conda install metview-batch -c conda-forge -y',
     ]
 ]
@@ -124,8 +126,9 @@ class CustomCommands(Command):
                 'Command %s failed: exit code: %s' % (command_list, p.returncode))
 
     def run(self):
-        for command in CUSTOM_COMMANDS:
-            self.RunCustomCommand(command)
+        pass
+        # for command in CUSTOM_COMMANDS:
+        #     self.RunCustomCommand(command)
 
 
 setup(

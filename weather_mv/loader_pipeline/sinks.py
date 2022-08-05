@@ -21,31 +21,39 @@ import shutil
 import tempfile
 import typing as t
 import os
-
+import io
+import apache_beam.io.gcp.gcsio
 import xarray.backends.cfgrib_
 from pyproj import Transformer
 import numpy as np
 import datetime
-from rasterio.io import MemoryFile
+from google.api_core.exceptions import NotFound
 import apache_beam as beam
 import rasterio
 import xarray as xr
 import cfgrib
 from apache_beam.io.filesystems import FileSystems
+from google.cloud import storage
+from subprocess import Popen, PIPE, STDOUT
 from apache_beam.io.gcp.gcsio import DEFAULT_READ_BUFFER_SIZE
-from osgeo import gdal
+from apache_beam.io.gcp.gcsio import GcsIO
 from urllib.parse import urlparse
 import pathlib
-from apache_beam.io.fileio import ReadableFile
 from apache_beam.io.filesystem import CompressionTypes
 from cfgrib.dataset import DatasetBuildError
-
+from rasterio.io import MemoryFile
 from hashlib import sha256
+from codetiming import Timer
+import fsspec
+import subprocess
 from .util import (
     DEFAULT_COORD_KEYS,
     _only_target_vars,
     convert_size
 )
+import socket
+CUSTOM_READ_BUFFER_SIZE = 1 * (1 << 20)
+HOSTNAME = socket.gethostname()
 TIF_TRANSFORM_CRS_TO = "EPSG:4326"
 # A constant for all the things in the coords key set that aren't the level name.
 
@@ -85,7 +93,7 @@ def _make_grib_dataset_inmem(grib_ds: xr.Dataset) -> xr.Dataset:
     return data_ds
 
 
-def _preprocess_tif(ds: xr.Dataset, filename: str, tif_metadata_for_datetime: str) -> xr.Dataset:
+def _preprocess_tif(ds: xr.Dataset, filename: t.Union[str, None], tif_metadata_for_datetime: str, rasterio_data_array: rasterio.DatasetReader = None) -> xr.Dataset:
     """Transforms (y, x) coordinates into (lat, long) and adds bands data in data variables.
 
     This also retrieves datetime from tif's metadata and stores it into dataset.
@@ -113,17 +121,24 @@ def _preprocess_tif(ds: xr.Dataset, filename: str, tif_metadata_for_datetime: st
     ds = xr.merge(band_data_list)
     ds.attrs['is_normalized'] = ds_is_normalized_attr
 
+    if rasterio_data_array:
+        rd = rasterio_data_array
+    rd = rasterio_data_array or rasterio.open(filename)
+
+
+
     # TODO(#159): Explore ways to capture required metadata using xarray.
-    with rasterio.open(filename) as f:
-        datetime_value_ms = None
-        try:
-            datetime_value_ms = f.tags()[tif_metadata_for_datetime]
-            ds = ds.assign_coords({'time': datetime.datetime.utcfromtimestamp(int(datetime_value_ms) / 1000.0)})
-        except KeyError:
-            raise RuntimeError(f"Invalid datetime metadata of tif: {tif_metadata_for_datetime}.")
-        except ValueError:
-            raise RuntimeError(f"Invalid datetime value in tif's metadata: {datetime_value_ms}.")
-        ds = ds.expand_dims('time')
+    # with rasterio.open(filename) as f:
+    datetime_value_ms = None
+    try:
+        datetime_value_ms = rasterio_data_array.tags()[tif_metadata_for_datetime]
+        ds = ds.assign_coords({'time': datetime.datetime.utcfromtimestamp(int(datetime_value_ms) / 1000.0)})
+    except KeyError:
+        raise RuntimeError(f"Invalid datetime metadata of tif: {tif_metadata_for_datetime}.")
+    except ValueError:
+        raise RuntimeError(f"Invalid datetime value in tif's metadata: {datetime_value_ms}.")
+    ds = ds.expand_dims('time')
+    rd.close()
 
     return ds
 
@@ -216,49 +231,67 @@ def __normalize_grib_dataset(filename: str) -> xr.Dataset:
     return xr.merge(_data_array_list)
 
 
+def __open_dataset_file(
+  filename: t.Union[str, t.BinaryIO],
+  uri: str,
+  uri_extension: str,
+  disable_grib_schema_normalization: bool,
+  open_dataset_kwargs: t.Optional[t.Dict] = None,
+  backend_kwargs: t.Optional[t.Dict] = None) -> xr.Dataset:
 
-def __open_dataset_file_new(
-    filename: t.Union[str, t.BinaryIO],
-    uri: str,
-    uri_extension: str,
-    disable_grib_schema_normalization: bool,
-    open_dataset_kwargs: t.Optional[t.Dict] = None) -> xr.Dataset:
-    backend_kwargs = {}
-
+    # NOTE(bahmandar): checks if file is a cfgrib to be used in for loop
     cfgrib_backend = xarray.backends.cfgrib_.CfgribfBackendEntrypoint()
     cfgrib_exists = cfgrib_backend.available
     """Opens the dataset at 'uri' and returns a xarray.Dataset."""
 
-    # If URI extension is .tif, try opening file by specifying engine="rasterio".
-    if open_dataset_kwargs is not None:
+    # NOTE(bahmandar): If someone gave kwargs skip everything else and use that
+    if open_dataset_kwargs:
         pass
+    # NOTE(bahmandar): For tif and no kwargs use rasterio
     elif uri_extension == '.tif':
-        # no kwargs and uri tif
         open_dataset_kwargs = {'engine': 'rasterio'}
-    elif cfgrib_backend.guess_can_open(uri):
-        # Its likely grib file
+    elif cfgrib_exists and cfgrib_backend.guess_can_open(uri):
         if not disable_grib_schema_normalization:
             # open with cfgrib.open_datasets
             logger.warning("Assuming grib.")
             logger.info("Normalizing the grib schema, name of the data variables will look like "
                         "'<level>_<height>_<attrs['GRIB_stepType']>_<key>'.")
-            return _add_is_normalized_attr(__normalize_grib_dataset(filename), True)
+            # NOTE(bahmandar): cfGrib can't handle file like so if it is file like
+            # then read it into bytes. This will be a major memory hit for large
+            # grib files
+            if isinstance(filename, str):
+                return _add_is_normalized_attr(__normalize_grib_dataset(filename), True)
+            else:
+                return _add_is_normalized_attr(__normalize_grib_dataset(filename.read()), True)
         else:
+            # NOTE(bahmandar): If disable_grib_schema_normalization is true and the file
+            # is a grib file then open with cfgrib engine
             if cfgrib_backend.available:
-                # Trying with explicit engine for cfgrib.
                 open_dataset_kwargs = {'engine': 'cfgrib'}
                 backend_kwargs={'indexpath': ''}
 
-
+    # NOTE(bahmandar): these can't be none. either filled or empty dicts
     open_dataset_kwargs = open_dataset_kwargs if open_dataset_kwargs is not None else {}
     backend_kwargs = backend_kwargs if backend_kwargs is not None else {}
 
+    # NOTE(bahmandar): Seems like when xarray lazy loads stuff and someone access it
+    # what was accessed will stay in memory. (i.e. ds.time[0].values twice in a row will
+    # not take twice the time cause cache is True. For our case we need it just once
+    # and don't want it to linger in memory so we set this to False
     open_dataset_kwargs['cache'] = False
+
+    # NOTE(bahmandar): Didn't see speed bumps with these but probably needs testing of
+    # different scenarios. Rather not use them if not needed
+    # open_dataset_kwargs['decode_times'] = False
+    # open_dataset_kwargs['decode_timedelta'] = False
+    # open_dataset_kwargs['decode_cf'] = False
+
+    # NOTE(bahmandar): Runs twice to match the original function. better to remove if
+    # not needed
     for attempt in range(2):
         try:
             return _add_is_normalized_attr(xr.open_dataset(filename, backend_kwargs=backend_kwargs, **open_dataset_kwargs), False)
-
-        # Saw datasetbuilderror
+        # NOTE(bahmandar): saw datasetbuilderror
         except (ValueError, DatasetBuildError) as e:
             if "multiple values for key 'edition'" not in str(e):
                 raise
@@ -267,213 +300,295 @@ def __open_dataset_file_new(
             continue
 
 
+def get_temp_gcs_info(uri: str, temp_gcs_location: str) -> t.Tuple[str, str]:
+    temp_gcs_parsed = urlparse(temp_gcs_location)
+    zar_name = uri_to_hash_file(uri, '.zarr')
+    bucket_name = temp_gcs_parsed.netloc
+    prefix = os.path.join(temp_gcs_parsed.path[1:], zar_name)
+    return bucket_name, prefix
 
-
-
-
-
-
-def __open_dataset_file(filename: str,
-                        uri_extension: str,
-                        disable_grib_schema_normalization: bool,
-                        open_dataset_kwargs: t.Optional[t.Dict] = None) -> xr.Dataset:
-    """Opens the dataset at 'uri' and returns a xarray.Dataset."""
-    if open_dataset_kwargs:
-        return _add_is_normalized_attr(xr.open_dataset(filename, **open_dataset_kwargs), False)
-
-    # If URI extension is .tif, try opening file by specifying engine="rasterio".
-    if uri_extension == '.tif':
-        return _add_is_normalized_attr(xr.open_dataset(filename, engine='rasterio'), False)
-
-    # If no open kwargs are available and URI extension is other than tif, make educated guesses about the dataset.
+# NOTE(bahmandar): if vm doesn't have allocated size then there will exist
+# no temp directory available
+def has_temp_dir():
     try:
-        return _add_is_normalized_attr(xr.open_dataset(filename), False)
-    except ValueError as e:
-        e_str = str(e)
-        if not ("Consider explicitly selecting one of the installed engines" in e_str and "cfgrib" in e_str):
-            raise
-
-    if not disable_grib_schema_normalization:
-        logger.warning("Assuming grib.")
-        logger.info("Normalizing the grib schema, name of the data variables will look like "
-                    "'<level>_<height>_<attrs['GRIB_stepType']>_<key>'.")
-        return _add_is_normalized_attr(__normalize_grib_dataset(filename), True)
-
-    # Trying with explicit engine for cfgrib.
-    try:
-        return _add_is_normalized_attr(
-            xr.open_dataset(filename, engine='cfgrib', backend_kwargs={'indexpath': ''}),
-            False)
-    except ValueError as e:
-        if "multiple values for key 'edition'" not in str(e):
-            raise
-    logger.warning("Assuming grib edition 1.")
-    # Try with edition 1
-    # Note: picking edition 1 for now as it seems to get the most data/variables for ECMWF realtime data.
-    return _add_is_normalized_attr(
-        xr.open_dataset(filename, engine='cfgrib', backend_kwargs={'filter_by_keys': {'edition': 1}, 'indexpath': ''}),
-        False)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            return True
+    except (RuntimeError, FileNotFoundError):
+        return False
 
 
-def uri_to_filepath(uri: str) -> str:
+def uri_to_filepath(uri: str, temp_dir: str) -> t.Union[str, None]:
+    local_filename = uri_to_hash_file(uri)
+    return os.path.join(temp_dir, local_filename)
+
+
+def uri_to_hash_file(uri: str, extension=None) -> str:
     uri_parsed = urlparse(uri)
-    extension = pathlib.Path(uri_parsed.path).suffix
+    if extension is None:
+        extension = pathlib.Path(uri_parsed.path).suffix
     local_filename = pathlib.Path(sha256(uri.encode()).hexdigest()[:22]).with_suffix(extension)
-    return str(tempfile.gettempdir() / local_filename)
+    return str(local_filename)
 
 
-def get_local(uri: str) -> str:
-    """Copy a cloud object (e.g. a netcdf, grib, or tif file) from cloud storage, like GCS, to local file."""
+def log_subprocess_output(pipe):
+    for line in iter(pipe.readline, ''): # b'\n'-separated lines
+        line_output = line.strip()
+        if line_output:
+            logger.info(f'subprocess: {line_output}')
 
-    #TODO need a method to check file integrity locally
-    local_file_location = uri_to_filepath(uri)
-    print(f'{local_file_location=}')
 
-
-    if not FileSystems.exists(local_file_location):
-        with FileSystems.open(uri) as remote_file:
-            with FileSystems.create(local_file_location) as local_file:
-                shutil.copyfileobj(remote_file, local_file, DEFAULT_READ_BUFFER_SIZE)
+@contextlib.contextmanager
+def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[t.Union[str, None]]:
+    t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
+    if has_temp_dir():
+        # with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.NamedTemporaryFile() as local_file_location:
+            # local_file_location = uri_to_filepath(uri, temp_dir)
+            # NOTE(bahmandar): This is really not used anymore because of using tempfile
+            # if not FileSystems.exists(local_file_location) or ignore_existing:
+            with FileSystems.create(local_file_location) as dest_file:
+                result = subprocess.run(f'gsutil du -s {uri}',
+                                        shell=True,
+                                        capture_output=True,
+                                        text=True)
+                if result.returncode != 0 and (source_file_size := int(result.stdout.split()[0]) == 0):
+                    logger.warning(result.stdout)
+                    logger.warning(result.stderr)
+                    yield None
+                else:
+                    source_file_size = int(result.stdout.split()[0])
+                    statvfs = os.statvfs(tempfile.gettempdir())
+                    disk_space_available = statvfs.f_frsize * statvfs.f_bavail
+                    # source_file_size = 1000 * (1 << 30)
+                    if source_file_size * 1.5 > disk_space_available:
+                        logger.warning(f'Short on Disk Space - Available: {convert_size(disk_space_available)} File: {convert_size(source_file_size)}')
+                        yield None
+                    else:
+                        process = Popen(['gcloud', 'alpha', 'storage', 'cp', uri, dest_file.name], stdout=PIPE, stderr=STDOUT, universal_newlines=True)
+                        with process.stdout:
+                            log_subprocess_output(process.stdout)
+                        exitcode = process.wait() # 0 means success
+                        if exitcode != 0:
+                            # with FileSystems().open(uri) as source_file:
+                            with apache_beam.io.gcsio.GcsIO().open(filename=uri,
+                                                                   read_buffer_size=CUSTOM_READ_BUFFER_SIZE,
+                                                                   mode="rb", mime_type='application/octet-stream') as source_file:
+                                shutil.copyfileobj(source_file, dest_file, CUSTOM_READ_BUFFER_SIZE)
+                        dest_file.flush()
+                        dest_file.seek(0)
+                        t.name = f'TTT {HOSTNAME}: Created Local GCS File: {dest_file.name}'
+                        t.stop()
+                        yield dest_file.name
+            # NOTE(bahmandar): This is really not used anymore because of using tempfile
+            # else:
+            #
+            #     with FileSystems.open(local_file_location) as local_file:
+            #         with FileSystems.open(uri) as remote_file:
+            #             if get_buffer_size(local_file) == get_buffer_size(remote_file):
+            #                 t.name = f'TTT {HOSTNAME}: Reused Local GCS File: {local_file_location}'
+            #                 t.stop()
+            #                 yield local_file_location
+            #             else:
+            #                 # NOTES(bahmandar): Need to test this out again
+            #                 t.name = f'TTT {HOSTNAME}: Deleted Corrupted File: {local_file_location}'
+            #                 t.stop()
+            #                 yield open_local_gcs(uri, True)
     else:
-        print(f'checksum={FileSystems.checksum(local_file_location)}')
-    return local_file_location
+        yield None
 
-
-def dump(obj):
-    for attr in dir(obj):
-        try:
-            print('obj.%s = %r' % (attr, getattr(obj, attr)))
-        except:
-            pass
 
 @contextlib.contextmanager
-def open_local(uri: str) -> t.Iterator[str]:
+def open_local(uri: str) -> t.ContextManager[str]:
     """Copy a cloud object (e.g. a netcdf, grib, or tif file) from cloud storage, like GCS, to local file."""
+    t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
     with FileSystems().open(uri) as source_file:
-        with tempfile.NamedTemporaryFile() as dest_file:
-            shutil.copyfileobj(source_file, dest_file, DEFAULT_READ_BUFFER_SIZE)
-            dest_file.flush()
-            dest_file.seek(0)
-            yield dest_file.name
+        # with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.NamedTemporaryFile() as local_file_location:
+            # local_file_location = uri_to_filepath(uri, temp_dir)
+            with FileSystems().create(local_file_location) as dest_file:
+                shutil.copyfileobj(source_file, dest_file, DEFAULT_READ_BUFFER_SIZE)
+                dest_file.flush()
+                dest_file.seek(0)
+                t.name = f'TTT {HOSTNAME}: Created Local File: {dest_file.name}'
+                t.stop()
+                yield dest_file.name
 
-
-@contextlib.contextmanager
-def open_dataset_modified(element: t.Union[ReadableFile,None],
-                          uri,
-                          open_dataset_kwargs: t.Optional[t.Dict] = None,
-                          disable_in_memory_copy: bool = False,
-                          disable_grib_schema_normalization: bool = False,
-                          tif_metadata_for_datetime: t.Optional[str] = None,
-                          disable_local_save: bool = False,
-                          area: t.Tuple[int, int, int, int] = None,
-                          variables: t.List[str] = None) -> t.Iterator[xr.Dataset]:
-    """Open the dataset at 'uri' and return a xarray.Dataset."""
+# NOTE(bahmandar): Gets subset if possible. returns nothing otherwise
+def get_dataset(bucket_name: str, prefix: str) -> t.Union[xarray.Dataset, None]:
     try:
-
-        logger.info(f'Opening: {uri}')
-        # print(rasterio.drivers.raster_driver_extensions())
-
-        # By copying the file locally, xarray can open it much faster via an in-memory copy.
-        _, uri_extension = os.path.splitext(uri)
-
-        # This if/else needs cleanup
-        if disable_local_save:
-            rasterio_path = os.path.join(os.sep, 'vsimem', uri_to_filepath(uri).lstrip("/"))
-            if not element:
-                filesystem = FileSystems.get_filesystem(uri)
-                element: ReadableFile = ReadableFile(filesystem.metadata(uri))
-        else:
-            rasterio_path = get_local(uri)
-            print(f'{rasterio_path=}')
-            filesystem = FileSystems.get_filesystem(rasterio_path)
-            element: ReadableFile = ReadableFile(filesystem.metadata(rasterio_path))
-
-        with element.open(mime_type='application/octet-stream', compression_type=CompressionTypes.AUTO) as uri_buffer:
-            logger.info(f'Element Open: {uri}')
-            gdal.UseExceptions()
-            if disable_local_save:
-                try:
-                    dataset = gdal.Open(rasterio_path, gdal.GA_ReadOnly)
-                except RuntimeError:
-                    print('create vsimem')
-                    gdal.FileFromMemBuffer(rasterio_path, uri_buffer.read())
-                    uri_buffer.seek(0)
-                finally:
-                    dataset = None
+        mapper = fsspec.get_mapper(url=f'gs://{bucket_name}/{prefix}', check=True)
+        t = Timer(name=f'TTT {HOSTNAME}: Received Dataset: gs://{bucket_name}/{prefix}', text='{name}: {:.2f} seconds', logger=logger.info)
+        t.start()
+        ds = xarray.open_zarr(store=mapper)
+        t.stop()
+    except ValueError as e:
+        # template = "An exception of type {0} occurred. Arguments:\n{1!r}"
+        # logger.warning(template.format(type(e).__name__, e.args))
+        ds = None
+    return ds
 
 
-
-            # open_dataset_kwargs['filter_by_keys'] = {'typeOfLevel': 'surface'}
-
-
-            disable_grib_schema_normalization = True
-            xr_dataset: xr.Dataset = __open_dataset_file_new(rasterio_path, uri, uri_extension, disable_grib_schema_normalization, open_dataset_kwargs)
-
-            logger.info(f'XR Dataset Loaded: {uri}')
-
-
-            if uri_extension == '.tif':
-                xr_dataset = _preprocess_tif(xr_dataset, rasterio_path, tif_metadata_for_datetime)
-
-            # if not disable_in_memory_copy:
-            #     xr_dataset = _make_grib_dataset_inmem(xr_dataset)
+# NOTE(bahmandar): saves subset as zarr for future workers to use.
+def save_dataset(ds: xarray.Dataset, bucket_name: str, prefix: str) -> None:
+    t = Timer(name=f'TTT {HOSTNAME}: Created Dataset: gs://{bucket_name}/{prefix}', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
+    mapper = fsspec.get_mapper(url=f'gs://{bucket_name}/{prefix}', create=True)
+    ds.to_zarr(store=mapper, mode='w')
+    logger.info(f'Dataset: gs://{bucket_name}/{prefix} Created')
+    t.stop()
 
 
-            # Extracting dtype, crs and transform from the dataset & storing them as attributes.
-            with rasterio.open(rasterio_path, 'r') as f:
-                # print(f.dtypes)
-                # print(f.nodatavals)
-                dtype, crs, transform = (f.profile.get(key) for key in ['dtype', 'crs', 'transform'])
-                xr_dataset.attrs.update({'dtype': dtype, 'crs': crs, 'transform': transform})
+# NOTE(bahmandar): This is not needed anymore because we are using tempfile
+# if we weren't then we would need to delete manually created files
+def delete_dataset(bucket_name: str, prefix: str) -> None:
+    t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    try:
+        blob = bucket.blob(prefix+'ds')
+        blob.delete()
+        t.name = f'TTT {HOSTNAME}: Deleted Dataset: gs://{bucket_name}/{prefix}'
+    except NotFound:
+        t.name = f'TTT {HOSTNAME}: Nothing to Delete: gs://{bucket_name}/{prefix}'
+        pass
+    t.stop()
 
 
-            logger.info(f'opened dataset size: {convert_size(xr_dataset.nbytes)}')
-            beam.metrics.Metrics.counter('Success', 'ReadNetcdfData').inc()
-
-            xr_dataset: xr.Dataset = _only_target_vars(xr_dataset, variables)
-
-            if area:
-                n, w, s, e = area
-                xr_dataset = xr_dataset.sel(latitude=slice(n, s), longitude=slice(w, e))
-                logger.info(f'Data filtered by area, size: {convert_size(xr_dataset.nbytes)}')
-        yield xr_dataset
-    except Exception as e:
-        beam.metrics.Metrics.counter('Failure', 'ReadNetcdfData').inc()
-        logger.error(f'Unable to open file {uri!r}: {e}')
-        raise
+def get_buffer_size(buff: t.BinaryIO) -> int:
+    buffer_size = buff.seek(0, io.SEEK_END)
+    buff.seek(0)
+    return buffer_size
 
 
 @contextlib.contextmanager
-def open_dataset(uri: str,
+def open_remote_gcs(uri: str) -> t.ContextManager[io.BufferedReader]:
+    t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
+    with GcsIO().open(filename=uri, read_buffer_size=CUSTOM_READ_BUFFER_SIZE,  mode="rb", mime_type='application/octet-stream') as file:
+        t.name = f'TTT {HOSTNAME}: Opened Remote GCS File: {pathlib.Path(uri).name}'
+        t.stop()
+        yield file
+
+
+@contextlib.contextmanager
+def open_remote(uri: str) -> t.ContextManager[io.BufferedReader]:
+    t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
+    with FileSystems.open(uri, mime_type='application/octet-stream', compression_type=CompressionTypes.AUTO) as file:
+        t.name = f'TTT {HOSTNAME}: Opened Remote File: {pathlib.Path(uri).name}'
+        t.stop()
+        yield file
+
+
+@contextlib.contextmanager
+def open_dataset(uri,
                  open_dataset_kwargs: t.Optional[t.Dict] = None,
                  disable_in_memory_copy: bool = False,
                  disable_grib_schema_normalization: bool = False,
-                 tif_metadata_for_datetime: t.Optional[str] = None) -> t.Iterator[xr.Dataset]:
+                 tif_metadata_for_datetime: t.Optional[str] = None,
+                 area: t.Tuple[int, int, int, int] = None,
+                 variables: t.List[str] = None,
+                 enable_local_save: bool = False,
+                 temp_gcs_location: str = None,
+                 run_rasterio: bool = False,
+                 backend_kwargs: t.Optional[t.Dict] = None
+                 ) -> t.ContextManager[xr.Dataset]:
     """Open the dataset at 'uri' and return a xarray.Dataset."""
+
     try:
-        # By copying the file locally, xarray can open it much faster via an in-memory copy.
-        with open_local(uri) as local_path:
-            _, uri_extension = os.path.splitext(uri)
-            xr_dataset: xr.Dataset = __open_dataset_file(local_path,
-                                                         uri_extension,
-                                                         disable_grib_schema_normalization,
-                                                         open_dataset_kwargs)
+        # NOTE(bahmandar): if a temp gcs location was given and the zarr file
+        # exists then use that
+        if temp_gcs_location:
+            bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
+            xr_dataset = get_dataset(bucket_name, prefix)
+        else:
+            xr_dataset = None
 
-            if uri_extension == '.tif':
-                xr_dataset = _preprocess_tif(xr_dataset, local_path, tif_metadata_for_datetime)
+        with contextlib.ExitStack() as stack:
+            if xr_dataset:
+                yield xr_dataset
+            else:
+                # NOTE(bahmandar): check if scipy and prefer local save
+                scipy_backend = xarray.backends.scipy_.ScipyBackendEntrypoint()
+                with FileSystems.open(uri) as f:
+                    if scipy_backend.available and scipy_backend.guess_can_open(f):
+                        logger.info('Local save is preferred for this file type')
+                        enable_local_save = True
 
-            if not disable_in_memory_copy:
-                xr_dataset = _make_grib_dataset_inmem(xr_dataset)
+                # NOTE(bahmandar): try to local gcs save and if it fails then
+                # resort to remote open
+                if enable_local_save:
+                    if FileSystems.get_scheme(uri) == 'gs':
+                        uri_buffer = stack.enter_context(open_local_gcs(uri))
+                        if uri_buffer is None:
+                            uri_buffer = stack.enter_context(open_remote_gcs(uri))
+                    else:
+                        # NOTE(bahmandar): This doesn't have a check if the system
+                        # is full
+                        uri_buffer = stack.enter_context(open_local(uri))
+                # NOTE(bahmandar): open gcs with a different buffer size
+                # but the following two could be merged into one at some point
+                elif FileSystems.get_scheme(uri) == 'gs':
+                    uri_buffer = stack.enter_context(open_remote_gcs(uri))
+                else:
+                    uri_buffer = stack.enter_context(open_remote(uri))
 
-            # Extracting dtype, crs and transform from the dataset & storing them as attributes.
-            with rasterio.open(local_path, 'r') as f:
-                dtype, crs, transform = (f.profile.get(key) for key in ['dtype', 'crs', 'transform'])
-                xr_dataset.attrs.update({'dtype': dtype, 'crs': crs, 'transform': transform})
+                _, uri_extension = os.path.splitext(uri)
 
-            logger.info(f'opened dataset size: {xr_dataset.nbytes}')
+                t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+                t.start()
+                xr_dataset: xr.Dataset = __open_dataset_file(uri_buffer, uri, uri_extension, disable_grib_schema_normalization, open_dataset_kwargs, backend_kwargs)
+                # NOTE(bahmandar): original size before filtering
+                original_size = xr_dataset.nbytes
+                t.name = f'TTT {HOSTNAME}: Opened Dataset: {pathlib.Path(uri).name}, {convert_size(xr_dataset.nbytes)}'
+                t.stop()
 
-            beam.metrics.Metrics.counter('Success', 'ReadNetcdfData').inc()
-            yield xr_dataset
+                beam.metrics.Metrics.counter('Success', 'ReadNetcdfData').inc()
+
+                if variables:
+                    xr_dataset: xr.Dataset = _only_target_vars(xr_dataset, variables)
+
+                if area:
+                    n, w, s, e = area
+                    xr_dataset = xr_dataset.sel(latitude=slice(n, s), longitude=slice(w, e))
+                    logger.info(f'Data filtered by area, size: {convert_size(xr_dataset.nbytes)}')
+
+                # NOTE(bahmandar): This is NOT TESTED and this will have to load everything into
+                # memory or have it available locally
+                if run_rasterio:
+                    with MemoryFile(uri_buffer) as memfile:
+                        with memfile.open() as dataset:
+                            data_array = dataset.read()
+                            dtype, crs, transform = (data_array.profile.get(key) for key in ['dtype', 'crs', 'transform'])
+                            xr_dataset.attrs.update({'dtype': dtype, 'crs': crs, 'transform': transform})
+                            # NOTE(bahmandar): NEEDS TO BE TESTED. This is inside
+                            # rasterio cause that is that is used inside _preprocess_tif
+                            if uri_extension == '.tif':
+                                xr_dataset = _preprocess_tif(xr_dataset, None, tif_metadata_for_datetime, data_array)
+
+                current_size = xr_dataset.nbytes
+                if current_size < original_size * 0.25 and temp_gcs_location:
+                    bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
+                    save_dataset(xr_dataset, bucket_name, prefix)
+                    xr_dataset = get_dataset(bucket_name, prefix)
+
+                # NOTE(bahmandar): Permenantly not used cause it will have signifcant memory issues
+                # with large files (i.e. greater than 2GiB).
+                disable_in_memory_copy = True
+                if not disable_in_memory_copy:
+                    t = Timer(name=f'TTT {HOSTNAME}: Loading Dataset: {pathlib.Path(uri).name}', text='{name}: {:.2f} seconds', logger=logger.info)
+                    t.start()
+                    # NOTE(bahmandar): compute seemed to the trick for loading it
+                    # and I'm not sure how will _make_grib_dataset_inmem will play with a
+                    # lazily loaded dask array. A way to check that is by lazy opening
+                    # a zarr and testing it out
+                    # xr_dataset = _make_grib_dataset_inmem(xr_dataset)
+                    xr_dataset = xr_dataset.compute()
+                    t.stop()
+                yield xr_dataset
     except Exception as e:
         beam.metrics.Metrics.counter('Failure', 'ReadNetcdfData').inc()
         logger.error(f'Unable to open file {uri!r}: {e}')

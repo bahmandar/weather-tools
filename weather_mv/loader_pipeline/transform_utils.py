@@ -1,12 +1,22 @@
+
+
+import numpy
 from apache_beam import typehints as tp
 import typing as t
 import apache_beam as beam
-from apache_beam.io.fileio import ReadableFile
 import datetime
 from google.cloud import bigquery
+from apache_beam.io.gcp.internal.clients import bigquery as bigquery_beam
 from apache_beam.transforms import window
 from apache_beam.io.restriction_trackers import OffsetRange
-from .sinks import open_dataset_modified
+
+from .sinks import (
+    open_dataset,
+    get_temp_gcs_info,
+    delete_dataset,
+    # delete_local_file
+)
+
 from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
 from apache_beam.coders.coders import VarIntCoder
 from xarray.core.utils import ensure_us_time_resolution
@@ -17,12 +27,16 @@ import xarray as xr
 import math
 import numpy as np
 import logging
-from .util import (
-  to_json_serializable_type,
-  get_iterator_minimal
 
+from codetiming import Timer
+from .util import (
+    to_json_serializable_type,
+    get_iterator_minimal
 )
+
 import dataclasses
+import socket
+HOSTNAME = socket.gethostname()
 
 DEFAULT_IMPORT_TIME = datetime.datetime.utcfromtimestamp(0).replace(tzinfo=datetime.timezone.utc).isoformat()
 DATA_IMPORT_TIME_COLUMN = 'data_import_time'
@@ -35,277 +49,326 @@ LATITUDE_RANGE = (-90, 90)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-def get_total_count_to_process(ds):
-  total_count = 0
-  for v in ds.keys():
-    total_count += math.prod(ds[v].shape)
+# def get_total_count_to_process(ds):
+#   total_count = 0
+#   for v in ds.keys():
+#     total_count += math.prod(ds[v].shape)
+#
+#   # print(f'{total_count=}')
+#   # print(f'{type(total_count)=}')
+#
+#   return total_count
 
-  # print(f'{total_count=}')
-  # print(f'{type(total_count)=}')
-
-  return total_count
-
+#
+# def get_total_count_to_process(ds):
+#   total_count = 0
+#
+#   for v in ds.keys():
+#     total_count += math.prod(ds[v].shape)
+#
+#   # print(f'{total_count=}')
+#   # print(f'{type(total_count)=}')
+#
+#   return total_count
 
 def fetch_geo_point(lat: float, long: float) -> str:
-  """Calculates a geography point from an input latitude and longitude."""
-  if lat > LATITUDE_RANGE[1] or lat < LATITUDE_RANGE[0]:
-    raise ValueError(f"Invalid latitude value '{lat}'")
+    """Calculates a geography point from an input latitude and longitude."""
+    if lat > LATITUDE_RANGE[1] or lat < LATITUDE_RANGE[0]:
+        raise ValueError(f"Invalid latitude value '{lat}'")
 
-  long = ((long + 180) % 360) - 180
-  point = json.dumps(geojson.Point((long, lat)))
-  return point
+    long = ((long + 180) % 360) - 180
+    point = json.dumps(geojson.Point((long, lat)))
+    return point
 
 class FileOutput(t.NamedTuple):
-  readable_file: ReadableFile
-  uri: str
-  num_of_elements: int
-  area: t.Tuple[int, int, int, int]
-  xarray_open_dataset_kwargs: t.Dict
-  disable_in_memory_copy: bool
-  tif_metadata_for_datetime: t.Optional[str]
-  disable_grib_schema_normalization: bool
-  disable_local_save: bool
-  coordinate_chunk_size: int
-  dry_run: bool
-  schema: t.List[bigquery.SchemaField]
-  table: bigquery.Table = None
-  variables: t.List[str] = None
-  import_time: t.Optional[datetime.datetime] = DEFAULT_IMPORT_TIME
+    uri: str
+    num_of_elements: int
+    area: t.Tuple[int, int, int, int]
+    xarray_open_dataset_kwargs: t.Dict
+    disable_in_memory_copy: bool
+    tif_metadata_for_datetime: t.Optional[str]
+    disable_grib_schema_normalization: bool
+    coordinate_chunk_size: int
+    dry_run: bool
+    schema: t.List[bigquery_beam.TableFieldSchema]
+    table: bigquery.Table = None
+    variables: t.List[str] = None
+    import_time: t.Optional[datetime.datetime] = DEFAULT_IMPORT_TIME
+    temp_gcs_location: str = None
+    enable_local_save: bool = False
 
-def map_dtype_to_sql_type(da: xr.DataArray) -> str:
-  """Maps a np.dtype to a suitable BigQuery column type."""
-  var_type = da.dtype
-  #this doesnt cover the case that item 1 is none, nan or null
-
-  if da.data.size == 1:
-    da_item = da.values.item()
-  else:
-    da_item = da.values.item(1)
-
-  if var_type in {np.dtype('float64'), np.dtype('float32'), np.dtype('timedelta64[ns]')}:
-    return 'FLOAT64'
-  elif var_type in {np.dtype('<M8[ns]')}:
-    return 'TIMESTAMP'
-  elif var_type in {np.dtype('int8'), np.dtype('int16'), np.dtype('int32'), np.dtype('int64')}:
-    return 'INT64'
-  elif type(da_item) == str:
-    return 'STRING'
-  elif var_type in {np.dtype(object)}:
-    if hasattr(da_item, 'isoformat'):
-      return 'DATETIME'
-  raise ValueError(f"Unknown mapping from '{var_type}' to SQL type")
+def map_dtype_to_sql_type(var_type: numpy.dtype, da_item: t.Any) -> str:
+    """Maps a np.dtype to a suitable BigQuery column type."""
+    #this doesnt cover the case that item 1 is none, nan or null
 
 
-def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery.SchemaField]:
-  """Returns a BigQuery table schema able to store the data in 'ds'."""
-  # Get the columns and data types for all variables in the dataframe
-  columns = [
-      (str(col), map_dtype_to_sql_type(ds[col]))
-      for col in ds.variables.keys() if ds[col].size != 0
-  ]
 
-  return to_table_schema(columns)
+    if var_type in {np.dtype('float64'), np.dtype('float32'), np.dtype('timedelta64[ns]')}:
+        return 'FLOAT64'
+    elif var_type in {np.dtype('<M8[ns]')}:
+        return 'TIMESTAMP'
+    elif var_type in {np.dtype('int8'), np.dtype('int16'), np.dtype('int32'), np.dtype('int64')}:
+        return 'INT64'
+    elif type(da_item) == str:
+        return 'STRING'
+    # NOTE(bahmandar): rasm.nc issue
+    elif var_type in {np.dtype(object)}:
+        if hasattr(da_item, 'isoformat'):
+            return 'DATETIME'
+    raise ValueError(f"Unknown mapping from '{var_type}' to SQL type")
 
-def to_table_schema(columns: t.List[t.Tuple[str, str]]) -> t.List[bigquery.SchemaField]:
-  # Fields are all Nullable because data may have NANs. We treat these as null.
-  fields = [
-      bigquery.SchemaField(column, var_type, mode='NULLABLE')
-      for column, var_type in columns
-  ]
 
-  # Add an extra columns for recording import metadata.
-  fields.append(bigquery.SchemaField(DATA_IMPORT_TIME_COLUMN, 'TIMESTAMP', mode='NULLABLE'))
-  fields.append(bigquery.SchemaField(DATA_URI_COLUMN, 'STRING', mode='NULLABLE'))
-  # fields.append(bigquery.SchemaField(DATA_FIRST_STEP, 'TIMESTAMP', mode='NULLABLE'))
-  fields.append(bigquery.SchemaField(GEO_POINT_COLUMN, 'GEOGRAPHY', mode='NULLABLE'))
+@Timer(name=f'TTT {HOSTNAME}: Inferred Schema From Data', text='{name}: {:.2f} seconds', logger=logger.info)
+def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery_beam.TableFieldSchema]:
+    """Returns a BigQuery table schema able to store the data in 'ds'."""
+    # Get the columns and data types for all variables in the dataframe
 
-  return fields
+    # NOTE(bahmandar): super slow cause it was loading xarray variable entirely
+    # columns = [
+    #     (str(col), map_dtype_to_sql_type(ds[col]))
+    #     for col in ds.variables.keys() if ds[col].size != 0
+    # ]
+
+    columns = []
+    for col in ds.variables.keys():
+        if ds[col].size != 0:
+            da_item = ds[col][tuple(0 for _ in range(len(ds[col].shape)))]
+            columns.append((str(col), map_dtype_to_sql_type(ds[col].dtype, da_item)))
+    return to_table_schema(columns)
+
+# NOTE(bahmandar): Is FIRST_STEP needed?
+def to_table_schema(columns: t.List[t.Tuple[str, str]]) -> t.List[bigquery_beam.TableFieldSchema]:
+    # Fields are all Nullable because data may have NANs. We treat these as null.
+    fields = [
+        bigquery_beam.TableFieldSchema(name=column, type=var_type, mode='NULLABLE')
+        for column, var_type in columns
+    ]
+    # Add an extra columns for recording import metadata.
+    fields.append(bigquery_beam.TableFieldSchema(name=DATA_IMPORT_TIME_COLUMN, type='TIMESTAMP', mode='NULLABLE'))
+    fields.append(bigquery_beam.TableFieldSchema(name=DATA_URI_COLUMN, type='STRING', mode='NULLABLE'))
+    # fields.append(bigquery.SchemaFieldbigquery_beam.TableFieldSchema(name=DATA_FIRST_STEP, type='TIMESTAMP', mode='NULLABLE'))
+    fields.append(bigquery_beam.TableFieldSchema(name=GEO_POINT_COLUMN, type='GEOGRAPHY', mode='NULLABLE'))
+    return fields
 
 
 class FanOut(beam.DoFn):
-  def process(self, element: t.List[FileOutput]) -> t.Iterable[FileOutput]:
-    for item in element:
-      yield item
+    def process(self, element: t.List[FileOutput]) -> t.Iterable[FileOutput]:
+        for item in element:
+            yield item
 
 class AddIndex(beam.DoFn):
-  """DoFn that will add indexes to pcollection increasing by one.
+    """DoFn that will add indexes to pcollection increasing by one.
 
-  Yields:
-    Tuple of the index and element
-  """
-  INDEX_FILE = ReadModifyWriteStateSpec(name='file_num', coder=VarIntCoder())
+    Yields:
+      Tuple of the index and element
+    """
+    INDEX_FILE = ReadModifyWriteStateSpec(name='file_num', coder=VarIntCoder())
 
-  def process(self,
-              element: tp.KV[int, tp.Any],
-              index_iterator=beam.DoFn.StateParam(INDEX_FILE)
-              ) -> tp.Iterable[tp.KV[int, t.Any]]:
-    current_index = index_iterator.read() or 1
-    yield (current_index, element[1])
-    index_iterator.write(current_index + 1)
+    def process(self,
+                element: tp.KV[int, tp.Any],
+                index_iterator=beam.DoFn.StateParam(INDEX_FILE)
+                ) -> tp.Iterable[tp.KV[int, t.Any]]:
+        current_index = index_iterator.read() or 1
+        yield (current_index, element[1])
+        index_iterator.write(current_index + 1)
 
 class WindowPerFile(beam.PTransform):
 
-  def expand(self, pcoll):
-    return (
-        pcoll
-        | 'Add Constant Key' >> beam.Map(lambda v: (0, v))
-        | 'Add Indexes' >> beam.ParDo(AddIndex())
-        | 'Add Timestamps' >> beam.Map(
-        lambda kv: window.TimestampedValue(kv, kv[0]))
-        | 'Add Session Windows' >> beam.WindowInto(window.Sessions(1))
-        | 'Remove Index Key' >> beam.Values()
-    )
+    def expand(self, pcoll):
+        return (
+                pcoll
+                | 'Add Constant Key' >> beam.Map(lambda v: (0, v))
+                | 'Add Indexes' >> beam.ParDo(AddIndex())
+                | 'Add Timestamps' >> beam.Map(
+            lambda kv: window.TimestampedValue(kv, kv[0]))
+                | 'Add Session Windows' >> beam.WindowInto(window.Sessions(1))
+                | 'Remove Index Key' >> beam.Values()
+        )
 
 @dataclasses.dataclass
 class PrepareFiles(beam.DoFn):
-  """TBD.
+    """TBD.
 
-  Yields:
-    TBD
-  """
-  variables: t.List[str] = None
-  area: t.Tuple[int, int, int, int] = None
-  import_time: t.Optional[datetime.datetime] = None
-  xarray_open_dataset_kwargs: t.Dict = None
-  disable_in_memory_copy: bool = None
-  tif_metadata_for_datetime: t.Optional[str] = None
-  disable_grib_schema_normalization: bool = None
-  infer_schema: bool = None
-  coordinate_chunk_size: int = 20 #10_000
-  disable_local_save: bool = False
-  dry_run: bool = True
+    Yields:
+      FileOutput Class Objects
+    """
 
-  def process(self, element: ReadableFile) -> tp.Iterable[tp.KV[int, FileOutput]]:
-    with open_dataset_modified(element,
-                               element.metadata.path,
-                               self.xarray_open_dataset_kwargs,
-                               self.disable_in_memory_copy,
-                               self.disable_grib_schema_normalization,
-                               self.tif_metadata_for_datetime,
-                               self.disable_local_save,
-                               self.area,
-                               self.variables
-                               ) as ds:
-      logger.info(f'Preparing File: {element.metadata.path}')
-      fields = {}
+    temp_gcs_location: str = None
+    variables: t.List[str] = None
+    area: t.Tuple[int, int, int, int] = None
+    import_time: t.Optional[datetime.datetime] = None
+    xarray_open_dataset_kwargs: t.Dict = None
+    disable_in_memory_copy: bool = None
+    tif_metadata_for_datetime: t.Optional[str] = None
+    disable_grib_schema_normalization: bool = None
+    infer_schema: bool = None
+    coordinate_chunk_size: int = 1_000_000
+    dry_run: bool = False
+    enable_local_save: bool = False
 
-      fields['readable_file'] = element
-      fields['num_of_elements'] = get_total_count_to_process(ds)
-      fields['uri'] = element.metadata.path
-      fields.update({k: dataclasses.asdict(self)[k] for k in FileOutput._fields if k in dataclasses.asdict(self)})
+    def process(self, uri: str) -> tp.Iterable[FileOutput]:
+        fields = {}
+        with open_dataset(uri,
+                                   self.xarray_open_dataset_kwargs,
+                                   self.disable_in_memory_copy,
+                                   self.disable_grib_schema_normalization,
+                                   self.tif_metadata_for_datetime,
+                                   self.area,
+                                   self.variables,
+                                   self.enable_local_save,
+                                   self.temp_gcs_location
+                                   ) as ds:
 
+            fields['num_of_elements'] = math.prod([v for k,v in ds.sizes.items()])
+            t = Timer(name=f'TTT {HOSTNAME}: Preparing: {pathlib.Path(uri).name}:{fields["num_of_elements"]}',
+                      text='{name}: {:.2f} seconds', logger=logger.info)
+            t.start()
 
-      if self.variables and not self.infer_schema and not ds.attrs['is_normalized']:
-        logger.info('Creating schema from input variables.')
-        fields['schema'] = to_table_schema(
-            [('latitude', 'FLOAT64'), ('longitude', 'FLOAT64'), ('time', 'TIMESTAMP')] +
-            [(var, 'FLOAT64') for var in self.variables]
-        )
-      else:
-        logger.info('Inferring schema from data.')
-        # ds: xr.Dataset = _only_target_vars(open_ds, self.variables)
-        fields['schema'] = dataset_to_table_schema(ds)
+            fields['uri'] = uri
+            fields.update({k: dataclasses.asdict(self)[k] for k in FileOutput._fields if k in dataclasses.asdict(self)})
 
-      yield 0, FileOutput(**fields)
+            if self.variables and not self.infer_schema and not ds.attrs['is_normalized']:
+                logger.info('Creating schema from input variables.')
+                fields['schema'] = to_table_schema(
+                    [('latitude', 'FLOAT64'), ('longitude', 'FLOAT64'), ('time', 'TIMESTAMP')] +
+                    [(var, 'FLOAT64') for var in self.variables]
+                )
+            else:
+                fields['schema'] = dataset_to_table_schema(ds)
 
-class ProcessXArray(beam.DoFn, beam.transforms.core.RestrictionProvider):
-  """Splittable DoFn that will process tar files.
-
-  Yields:
-    generator of TarOutput objects.
-  """
-
-  def __init__(self):
-
-    super().__init__()
-
-  def initial_restriction(self, element: FileOutput):
-
-    return OffsetRange(0, element.num_of_elements)
-
-  def create_tracker(self, restriction):
-    return beam.io.restriction_trackers.OffsetRestrictionTracker(restriction)
-
-  def split(self, element: FileOutput, restriction):
-    i = restriction.start
-    # element.coordinate_chunk_size
-    split_size = element.coordinate_chunk_size
-    # split_size = 49032000
-    while i < restriction.stop - split_size:
-      yield OffsetRange(i, i + split_size)
-      i += split_size
-    yield OffsetRange(i, restriction.stop)
-
-  def restriction_size(self, element: FileOutput, restriction):
-    return restriction.size()
-
-  def process(self, element: FileOutput,
-              tracker=beam.DoFn.RestrictionParam()):
-    # with element.open() as file:
-
-    with open_dataset_modified(element.readable_file,
-                               element.uri,
-                               element.xarray_open_dataset_kwargs,
-                               element.disable_in_memory_copy,
-                               element.disable_grib_schema_normalization,
-                               element.tif_metadata_for_datetime,
-                               element.disable_local_save,
-                               element.area,
-                               element.variables
-                               ) as ds:
-      current_position = tracker.current_restriction().start
-      file_name = pathlib.Path(element.uri).stem
-      trying = True
-      while tracker.try_claim(current_position):
-        end = tracker.current_restriction().stop
-
-        for idx, item in enumerate(get_iterator_minimal(ds, current_position, end), start=1):
-
-          # print(idx, item)
-          variable = item[0]
-          position = item[1]
-          row_ds = ds[variable][position]
-
-          # print(f'{ds[variable][position].data=}')
+            t.stop()
+            yield FileOutput(**fields)
 
 
+class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
+    """Splittable DoFn that will process FileOutput
 
-          pcoll_key = []
-          row = {variable: to_json_serializable_type(ensure_us_time_resolution(row_ds.data[()]))}
-          coords = {}
+    Yields:
 
-          for key, value in row_ds.coords.items():
-            coord_value = to_json_serializable_type(ensure_us_time_resolution(value.data[()]))
-            # row[key] = coord_value
-            pcoll_key.append({key: coord_value})
-            coords[key] = coord_value
-            # pcoll_key.append(coord_value)
-            # Re-calculate import time for streaming extractions.
-          if not element.import_time:
-            import_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
-          else:
-            import_time = element.import_time
-          pcoll_key.append({DATA_IMPORT_TIME_COLUMN: import_time})
-          pcoll_key.append({DATA_URI_COLUMN: element.uri})
-          # pcoll_key[DATA_IMPORT_TIME_COLUMN] = element.import_time
-          # pcoll_key[DATA_URI_COLUMN] = element.uri
+    """
 
-          # row[DATA_FIRST_STEP] = first_time_step
+    def __init__(self):
+        self.uris = []
+        self.temp_gcs_location = None
+        super().__init__()
 
-          # pcoll_key.append({GEO_TYPE: 'Feature'})
-          if 'latitude' in coords and 'longitude' in coords:
-            pcoll_key.append({GEO_POINT_COLUMN: fetch_geo_point(coords['latitude'], coords['longitude'])})
-          # pcoll_key[GEO_TYPE] = 'Feature'
-          # pcoll_key[GEO_POINT_COLUMN] = fetch_geo_point(pcoll_key['latitude'], pcoll_key['longitude'])
-          # print(f"{tuple(pcoll_key)=}")
-          # print(json.dumps(row,indent=2))
-          # print(pcoll_key)
-          # print(row)
-          yield pcoll_key, row
+    def delete_temp_files(self):
+        uris = list(set(self.uris))
+        for uri in uris:
+            if self.temp_gcs_location:
+                bucket_name, prefix = get_temp_gcs_info(uri, self.temp_gcs_location)
+                delete_dataset(bucket_name, prefix)
+            # NOTE(bahmandar): not needed because tempfile module will cleanup
+            # delete_local_file(uri)
+        self.uris = []
 
-          if (current_position + idx) >= end or not tracker.try_claim(current_position + idx):
-            break
+    # NOTE(bahmandar): This will run if job is "stopped"
+    def teardown(self):
+        self.delete_temp_files()
+        super().teardown()
 
-          # might not be needed. good to run with and without this statement for comparison
+    def start_bundle(self):
+        self.uris = []
+        # NOTE(bahmandar): Might be better elsewhere? This fills in DATA_IMPORT_TIME_COLUMN
+        self.current_time = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc).isoformat()
+        super().start_bundle()
 
-        current_position += end
+    def initial_restriction(self, element: FileOutput):
+        return OffsetRange(0, element.num_of_elements)
+
+    def create_tracker(self, restriction):
+        return beam.io.restriction_trackers.OffsetRestrictionTracker(restriction)
+
+    # NOTE(bahmandar): This dictates the immediate splitting. smaller number
+    def split(self, element: FileOutput, restriction):
+        i = restriction.start
+        split_size = element.coordinate_chunk_size
+        while i < restriction.stop - split_size:
+            yield OffsetRange(i, i + split_size)
+            i += split_size
+        yield OffsetRange(i, restriction.stop)
+
+    def restriction_size(self, element, restriction):
+        return restriction.size()
+
+    def process(self, element: FileOutput,
+                tracker=beam.DoFn.RestrictionParam()) -> t.Iterable[t.Dict]:
+        self.temp_gcs_location = element.temp_gcs_location
+        # NOTE(bahmandar): Adding uris to cleanup later
+        self.uris.append(element.uri)
+        with open_dataset(element.uri,
+                          element.xarray_open_dataset_kwargs,
+                          element.disable_in_memory_copy,
+                          element.disable_grib_schema_normalization,
+                          element.tif_metadata_for_datetime,
+                          element.area,
+                          element.variables,
+                          element.enable_local_save,
+                          element.temp_gcs_location
+                          ) as ds:
+
+            current_position = tracker.current_restriction().start
+            file_name = pathlib.Path(element.uri).name
+
+            while tracker.try_claim(current_position):
+                end = tracker.current_restriction().stop
+
+                t = Timer(name=f'TTT {HOSTNAME}: Processing: {file_name}, Start: {current_position}, End: {end}, Range: {end-current_position}', text='{name}: {:.2f} seconds', logger=logger.info)
+                t.start()
+
+                # NOTE(bahmandar): This will return a list of dictionarys based on the shape
+                # of the dimensions. i.e. {time:0, longitude:0, latitude:0, depth:0},
+                # {time:0, longitude:3, latitude:2, depth:0}
+                result = get_iterator_minimal(ds.sizes, current_position, end)
+
+
+                # NOTE(bahmandar): Turn the result above to a list of tuples
+                # [(longitude, 0),(longitude, 1),(depth, 0) ...]
+                result_tuple_list = [(k, v) for f in result for k,v in f.items()]
+                # NOTE(bahmandar): This will give me the max and min of each dimensions
+                # as a dict {time:0, longitude:0, latitude:0, depth:0} and
+                #{time:1, longitude:740, latitude:1440, depth:20}
+                first = dict(sorted(result_tuple_list, reverse=True))
+                last = dict(sorted(result_tuple_list, reverse=False))
+
+                # NOTE(bahmandar): the goal of this below is to make a dict that
+                # looks something like this {time:slice(0,1), longitude:slice(0,700), latitude:slice(0,1440), depth:slice(0,20)}
+                output_dict = {}
+                for key, value in first.items():
+                    output_dict[key] = slice(first[key], last[key]+1, 1)
+                # NOTE(bahmandar): loading this now to memory is much faster than
+                # loading one by one in the for loop below
+                sliced_ds_large = ds.isel(**output_dict, drop=True).compute()
+
+                for idx, item in enumerate(result, start=1):
+
+                    row = {}
+                    # NOTE(bahmandar): Need to add an offset because we are using
+                    # sliced_ds_large instead of the original dataset
+                    item = {k: item.get(k, 0) - first.get(k, 0) for k in item.keys() | first.keys()}
+                    sliced_ds = sliced_ds_large.isel(**item)
+
+                    for key, value in dict(sliced_ds.variables, **sliced_ds.coords).items():
+                        row[key] = to_json_serializable_type(ensure_us_time_resolution(value.data))
+
+                    if not element.import_time:
+                        import_time = self.current_time
+                    else:
+                        import_time = element.import_time
+
+                    row[DATA_IMPORT_TIME_COLUMN] = import_time
+                    row[DATA_URI_COLUMN] = element.uri
+
+                    if 'latitude' in row and 'longitude' in row:
+                        row[GEO_POINT_COLUMN] = fetch_geo_point(row['latitude'], row['longitude'])
+                    yield row
+
+                    # NOTE(bahmandar): without this statement dataflow would give
+                    # warnings of process has gone for xxx seconds without a response
+                    # this will also let dataflow know the progress for increasing workers
+                    if (current_position + idx) >= end or not tracker.try_claim(current_position + idx):
+                        break
+                t.stop()
+
+                current_position += end
+

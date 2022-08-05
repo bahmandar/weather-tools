@@ -30,9 +30,10 @@ import apache_beam as beam
 from apache_beam.io import WriteToBigQuery, BigQueryDisposition
 from apache_beam.options.pipeline_options import PipelineOptions
 from google.cloud import bigquery
+from apache_beam.io.gcp.internal.clients import bigquery as bigquery_beam
 from xarray.core.utils import ensure_us_time_resolution
 import pathlib
-from .sinks import ToDataSink, open_dataset, open_dataset_modified
+from .sinks import ToDataSink
 from apache_beam.typehints import Iterable
 from apache_beam.typehints import Tuple
 from apache_beam.io import fileio
@@ -51,7 +52,7 @@ from .util import (
 from .transform_utils import (
     FanOut,
     WindowPerFile,
-    ProcessXArray,
+    ProcessFiles,
     PrepareFiles
 )
 
@@ -66,35 +67,13 @@ logger.setLevel(logging.INFO)
 # GEO_TYPE = 'type'
 # LATITUDE_RANGE = (-90, 90)
 
-
-
-
-
-def merge_dicts(element):
-    row_data = element[0]
-    for item in element[1]:
-        row_data.update(item)
-
-
-
-def print_row(element):
-    print('asssd')
-    print(element)
-
-    return element[1]
-
+# NOTE(bahmandar): function is not needed anymore
 def format_records(element) -> t.Dict:
     # output_dict = {"properties": {}}
     output_dict = {}
     for item in [i for sub in element for i in sub]:
         output_dict.update(item)
-        # if next(iter(item)) in ('geometry', 'type'):
-        #     output_dict.update(item)
-        # else:
-        #     output_dict['properties'].update(item)
-
     return output_dict
-
 
 
 @dataclasses.dataclass
@@ -112,6 +91,8 @@ class ToBigQuery(ToDataSink):
     `these docs`_ for more.
 
     Attributes:
+        # NOTE(bahmandar): need to get the num of elements for each file so the example_uri
+        # is no longer needed
         # example_uri: URI to a weather data file, used to infer the BigQuery schema.
         output_table: The destination for where data should be written in BigQuery
         variables: Target variables (or coordinates) for the BigQuery schema. By default,
@@ -129,13 +110,20 @@ class ToBigQuery(ToDataSink):
         skip_region_validation: Turn off validation that checks if all Cloud resources
           are in the same region.
         disable_grib_schema_normalization: Turn off grib's schema normalization; Default: normalization enabled.
+        
+        # NOTE(bahmandar): This will now dictate the immediate splitting of the
+        # splittable dofn. How fast to parallelize across workers
         coordinate_chunk_size: How many coordinates (e.g. a cross-product of lat/lng/time
           xr.Dataset coordinate indexes) to group together into chunks. Used to tune
           how data is loaded into BigQuery in parallel.
+          
+        # NOTE(bahmandar): option to save locally if wanted
+        enable_local_save: Will save files to each local VM. Default is False
 
     .. _these docs: https://beam.apache.org/documentation/io/built-in/google-bigquery/#setting-the-insertion-method
     """
     # example_uri: str
+    temp_gcs_location: str
     output_table: str
     variables: t.List[str]
     area: t.Tuple[int, int, int, int]
@@ -146,10 +134,12 @@ class ToBigQuery(ToDataSink):
     tif_metadata_for_datetime: t.Optional[str]
     skip_region_validation: bool
     disable_grib_schema_normalization: bool
-    coordinate_chunk_size: int = 10_000
-    disable_local_save: bool = False
-    table_schema: t.List[bigquery.SchemaField] = None
+    coordinate_chunk_size: int = 1_000_000
+    table_schema: bigquery_beam.TableSchema = None
     project: str = None
+    enable_local_save: bool = False
+    skip_table_creation: bool = True
+
 
     @classmethod
     def add_parser_arguments(cls, subparser: argparse.ArgumentParser):
@@ -176,19 +166,19 @@ class ToBigQuery(ToDataSink):
                                     'Applicable only for tif files.')
         subparser.add_argument('-s', '--skip-region-validation', action='store_true', default=False,
                                help='Skip validation of regions for data migration. Default: off')
-        subparser.add_argument('--coordinate_chunk_size', type=int, default=500_000,
+        subparser.add_argument('--coordinate_chunk_size', type=int, default=100_000,
                                help='The size of the chunk of coordinates used for extracting vector data into '
                                     'BigQuery. Used to tune parallel uploads.')
         subparser.add_argument('--disable_grib_schema_normalization', action='store_true', default=False,
                                help="To disable grib's schema normalization. Default: off")
-        subparser.add_argument('--disable_local_save', action='store_true', default=False,
-                               help="To disable local save to vm worker Default: off")
+        subparser.add_argument('--enable_local_save', action='store_true', default=False,
+                               help="To enable saving files to each vm Default: off")
 
     @classmethod
     def validate_arguments(cls, known_args: argparse.Namespace, pipeline_args: t.List[str]) -> None:
         pipeline_options = PipelineOptions(pipeline_args)
         pipeline_options_dict = pipeline_options.get_all_options()
-
+        
         if known_args.area:
             assert len(known_args.area) == 4, 'Must specify exactly 4 lat/long values for area: N, W, S, E boundaries.'
 
@@ -207,77 +197,134 @@ class ToBigQuery(ToDataSink):
                             region=pipeline_options_dict.get('region'))
             logger.info('Region validation completed successfully.')
 
-    def set_elment_table(self, element, table):
-        return element._replace(table=table)
-
+    # NOTE(bahmandar): This will process all the schemas received from different
+    # files
     def get_schema(self, sets):
         table_schema = []
+        schema_fields = []
         elements = sets[1]
         for item in elements:
             item_schema_names = [x.name for x in table_schema]
             for schema_field in item.schema:
                 if schema_field.name not in item_schema_names:
-                    table_schema.append(schema_field)
+                    schema_fields.append(schema_field)
+                    table_schema.append(bigquery.SchemaField(name=schema_field.name,field_type=schema_field.type,mode=schema_field.mode))
         if elements[0].dry_run:
             logger.debug('Created the BigQuery table with schema...')
             table = None
+            output_schema = None
+
         else:
             # Create the table in BigQuery
             try:
-                # table_id = "your-project.your_dataset.your_table_name"
                 table = bigquery.Table(self.output_table.replace(":","."), schema=table_schema)
                 table = bigquery.Client().create_table(table, exists_ok=True)
             except Exception as e:
                 logger.error(f'Unable to create table in BigQuery: {e}')
                 raise
-        elements = list(map(lambda n: self.set_elment_table(n, table=table), elements))
-
-
-        return elements
-
+        # elements = list(map(lambda n: self.set_elment_table(n, table=table), elements))
+        return schema_fields
 
 
 
-    def __post_init__(self):
-        """Initializes Sink by creating a BigQuery tzable based on user input."""
-        logging.info('Post INIT')
+    def get_table_input(self, element):
+        logger.info(f'TTT: getting table info {self.output_table} from {element} ')
+        return self.output_table
 
+
+    # NOTE(bahmandar): This is no longer needed each file will be scanned for 
+    # the schema because we already have to scan the file for the number of 
+    # elements
+    
+    # def __post_init__(self):
+    #     """Initializes Sink by creating a BigQuery table based on user input."""
+        # with open_dataset(self.example_uri, self.xarray_open_dataset_kwargs, True,
+        #                   self.disable_grib_schema_normalization, self.tif_metadata_for_datetime) as open_ds:
+        #     # Define table from user input
+        #     if self.variables and not self.infer_schema and not open_ds.attrs['is_normalized']:
+        #         logger.info('Creating schema from input variables.')
+        #         table_schema = to_table_schema(
+        #             [('latitude', 'FLOAT64'), ('longitude', 'FLOAT64'), ('time', 'TIMESTAMP')] +
+        #             [(var, 'FLOAT64') for var in self.variables]
+        #         )
+        #     else:
+        #         logger.info('Inferring schema from data.')
+        #         ds: xr.Dataset = _only_target_vars(open_ds, self.variables)
+        #         table_schema = dataset_to_table_schema(ds)
+        #
+        # if self.dry_run:
+        #     logger.debug('Created the BigQuery table with schema...')
+        #     logger.debug(f'\n{pformat(table_schema)}')
+        #     return
+        #
+        # # Create the table in BigQuery
+        # try:
+        #     table = bigquery.Table(self.output_table, schema=table_schema)
+        #     self.table = bigquery.Client().create_table(table, exists_ok=True)
+        # except Exception as e:
+        #     logger.error(f'Unable to create table in BigQuery: {e}')
+        #     raise
 
     def expand(self, paths):
 
         """Extract rows of variables from data paths into a BigQuery table."""
 
-        extracted_rows = (
+        prepared_files = (
             paths
-            | 'Read Matches' >> fileio.ReadMatches()
+            # NOTE(bahmandar): PrepareFile dataclass variables are being filled
+            # with what is in the ToBigQuery class
             | 'Prepare Files' >> beam.ParDo(PrepareFiles(*(dataclasses.asdict(self).get(k.name) for k in dataclasses.fields(PrepareFiles))))
-            | 'Get common items' >> beam.GroupByKey()
+            # NOTE(bahmandar): shuffled in case of fusion. Might not be needed
+            | 'Shuffle' >> beam.Reshuffle()
+            
+            # NOTE(bahmandar): the three transforms below are not utilized anymore
+            # this was used if each variable in the file was processed by itself
+            # individually and then grouped together in rows based on the unique
+            # coords (which was the key)
+            # | 'Add Window Per File' >> WindowPerFile()
+            # | 'Group by Key' >> beam.GroupByKey()
+            # | 'Format Records' >> beam.Map(format_records)
+        )
+        # NOTE(bahmandar): a "schema" is created for each file and then turned into
+        # a list
+        schema = beam.pvalue.AsList(
+            prepared_files
+            | 'Add Key' >> beam.Map(lambda v: (0, v))
+            | 'Group Schemas' >> beam.GroupByKey()
             | 'Create Schema' >> beam.Map(self.get_schema)
-            | 'Fan out' >> beam.ParDo(FanOut())
-            | 'Add Window Per File' >> WindowPerFile()
-            | 'Process Files' >> beam.ParDo(ProcessXArray())
-            | 'Group by Key' >> beam.GroupByKey()
-            | 'Format Records' >> beam.Map(format_records)
-
 
         )
-        #Issue with project??
+
+        extracted_rows = (
+            prepared_files | 'Process Files' >> beam.ParDo(ProcessFiles())
+        )
+
+
         if not self.dry_run:
             (
                     extracted_rows
                     | 'WriteToBigQuery' >> WriteToBigQuery(
                         project=self.project,
                         table=self.output_table,
-                        method=beam.io.WriteToBigQuery.Method.FILE_LOADS,
+                        schema=lambda element, side_input: bigquery_beam.TableSchema(fields=side_input[0]),
+                        schema_side_inputs=(schema,),
+                        method=WriteToBigQuery.Method.FILE_LOADS,
                         write_disposition=BigQueryDisposition.WRITE_APPEND,
-                        create_disposition=BigQueryDisposition.CREATE_NEVER)
+                        create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
+                        additional_bq_parameters={
+                            'schemaUpdateOptions': [
+                                'ALLOW_FIELD_ADDITION',
+                                # 'ALLOW_FIELD_RELAXATION',
+                            ]
+                        })
             )
         else:
             pass
-            # (
-            #         extracted_rows
-            #         | 'Log Extracted Rows' >> beam.Map(logger.debug)
-            # )
+            # NOTE(bahmandar): needs testing
+            (
+                    extracted_rows
+                    | 'Log Extracted Rows' >> beam.Map(logger.debug)
+            )
 
 
 
