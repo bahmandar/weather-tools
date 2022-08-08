@@ -1,0 +1,10 @@
+steps:
+- name: 'gcr.io/kaniko-project/executor:latest'
+  args:
+  - --destination=gcr.io/${PROJECT_ID}/dataflow/geobeam:weather-mv
+  - --cache=true
+  - --cache-ttl=557500h
+  - --dockerfile=DockerfileGeobeam
+timeout: 3600s
+options:
+  machineType: 'N1_HIGHCPU_32'
