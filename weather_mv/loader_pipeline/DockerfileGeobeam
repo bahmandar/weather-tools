@@ -78,7 +78,7 @@ RUN pip install --upgrade pip
 RUN pip install gdal==$GDAL_VERSION
 COPY requirements.txt ${WORKDIR}/requirements.txt
 RUN pip install --upgrade pip
-RUN pip install --no-deps --force-reinstall -r ${WORKDIR}/requirements.txt
+RUN pip install --force-reinstall -r ${WORKDIR}/requirements.txt
 #https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
 RUN $(gcloud info --format="value(basic.python_location)") -m pip install numpy
 RUN gcloud components install alpha
