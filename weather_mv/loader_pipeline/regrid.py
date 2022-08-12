@@ -24,14 +24,35 @@ import typing as t
 import apache_beam as beam
 from apache_beam.io.filesystems import FileSystems
 from apache_beam.io.gcp.gcsio import WRITE_CHUNK_SIZE
-
+import threading
 from .sinks import ToDataSink, open_local
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 try:
-    import metview as mv
+    # when running weather-mv bq this would error cause metview is not on the main thread
+    # File "/usr/local/lib/python3.8/site-packages/loader_pipeline/__init__.py", line 18, in <module>
+    # from .pipeline import run, pipeline
+    # File "/usr/local/lib/python3.8/site-packages/loader_pipeline/pipeline.py", line 28, in <module>
+    # from .regrid import Regrid
+    # File "/usr/local/lib/python3.8/site-packages/loader_pipeline/regrid.py", line 34, in <module>
+    # import metview as mv
+    # File "/usr/local/lib/python3.8/site-packages/metview/__init__.py", line 44, in <module>
+    # raise exp
+    # File "/usr/local/lib/python3.8/site-packages/metview/__init__.py", line 28, in <module>
+    # from . import bindings as _bindings
+    # File "/usr/local/lib/python3.8/site-packages/metview/bindings.py", line 196, in <module>
+    # mi = MetviewInvoker()
+    # File "/usr/local/lib/python3.8/site-packages/metview/bindings.py", line 87, in __init__
+    # signal.signal(signal.SIGUSR1, self.signal_from_metview)
+    # File "/usr/local/lib/python3.8/signal.py", line 47, in signal
+    # handler = _signal.signal(_enum_to_int(signalnum), _enum_to_int(handler))
+    # ValueError: signal only works in main thread
+    if threading.current_thread() is threading.main_thread():
+        import metview as mv
+    else:
+        logger.error('Metview not on main thread.')
 except (ModuleNotFoundError, ImportError, FileNotFoundError):
     logger.error('Metview could not be imported.')
     mv = None  # noqa

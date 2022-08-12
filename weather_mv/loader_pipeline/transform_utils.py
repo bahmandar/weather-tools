@@ -10,11 +10,11 @@ from apache_beam.io.gcp.internal.clients import bigquery as bigquery_beam
 from apache_beam.transforms import window
 from apache_beam.io.restriction_trackers import OffsetRange
 
+
 from .sinks import (
     open_dataset,
-    get_temp_gcs_info,
-    delete_dataset,
-    # delete_local_file
+    delete_remote_temp_files,
+    delete_local_temp_files
 )
 
 from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
@@ -27,6 +27,7 @@ import xarray as xr
 import math
 import numpy as np
 import logging
+from apache_beam import pvalue
 
 from codetiming import Timer
 from .util import (
@@ -95,7 +96,8 @@ class FileOutput(t.NamedTuple):
     variables: t.List[str] = None
     import_time: t.Optional[datetime.datetime] = DEFAULT_IMPORT_TIME
     temp_gcs_location: str = None
-    enable_local_save: bool = False
+    enable_local_save: bool = None
+    attrs: dict = None
 
 def map_dtype_to_sql_type(var_type: numpy.dtype, da_item: t.Any) -> str:
     """Maps a np.dtype to a suitable BigQuery column type."""
@@ -193,6 +195,10 @@ class PrepareFiles(beam.DoFn):
       FileOutput Class Objects
     """
 
+    def setup(self):
+        self.uris = []
+        super().setup()
+
     temp_gcs_location: str = None
     variables: t.List[str] = None
     area: t.Tuple[int, int, int, int] = None
@@ -204,10 +210,35 @@ class PrepareFiles(beam.DoFn):
     infer_schema: bool = None
     coordinate_chunk_size: int = 1_000_000
     dry_run: bool = False
-    enable_local_save: bool = False
+    enable_local_save: bool = None
+    uris: t.List[str] = None
+
+
+    #
+    # def delete_temp_files(self):
+    #     if self.uris:
+    #         uris = list(set(self.uris))
+    #         for uri in uris:
+    #             if self.temp_gcs_location:
+    #                 # bucket_name, prefix = get_temp_gcs_info(uri, self.temp_gcs_location)
+    #                 # delete_dataset(bucket_name, prefix)
+    #                 # NOTE(bahmandar): In prepare we only want to delete any local files and
+    #                 # leave the temp gcs files for processing later
+    #                 delete_local_file(uri)
+    #         self.uris = []
+    #
+    # # NOTE(bahmandar): This will run if job is "stopped"
+    def teardown(self):
+        delete_local_temp_files(self.uris)
+        super().teardown()
+    #
+    def finish_bundle(self):
+        delete_local_temp_files(self.uris)
+        super().finish_bundle()
 
     def process(self, uri: str) -> tp.Iterable[FileOutput]:
         fields = {}
+        self.uris.append(uri)
         with open_dataset(uri,
                                    self.xarray_open_dataset_kwargs,
                                    self.disable_in_memory_copy,
@@ -218,12 +249,11 @@ class PrepareFiles(beam.DoFn):
                                    self.enable_local_save,
                                    self.temp_gcs_location
                                    ) as ds:
-
             fields['num_of_elements'] = math.prod([v for k,v in ds.sizes.items()])
             t = Timer(name=f'TTT {HOSTNAME}: Preparing: {pathlib.Path(uri).name}:{fields["num_of_elements"]}',
                       text='{name}: {:.2f} seconds', logger=logger.info)
             t.start()
-
+            fields['attrs'] = ds.attrs
             fields['uri'] = uri
             fields.update({k: dataclasses.asdict(self)[k] for k in FileOutput._fields if k in dataclasses.asdict(self)})
 
@@ -252,20 +282,16 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
         self.temp_gcs_location = None
         super().__init__()
 
-    def delete_temp_files(self):
-        uris = list(set(self.uris))
-        for uri in uris:
-            if self.temp_gcs_location:
-                bucket_name, prefix = get_temp_gcs_info(uri, self.temp_gcs_location)
-                delete_dataset(bucket_name, prefix)
-            # NOTE(bahmandar): not needed because tempfile module will cleanup
-            # delete_local_file(uri)
-        self.uris = []
 
     # NOTE(bahmandar): This will run if job is "stopped"
     def teardown(self):
-        self.delete_temp_files()
+        delete_local_temp_files(self.uris)
+        # delete_remote_temp_files(self.uris, self.temp_gcs_location)
         super().teardown()
+
+    def finish_bundle(self):
+        delete_local_temp_files(self.uris)
+        super().finish_bundle()
 
     def start_bundle(self):
         self.uris = []
@@ -309,7 +335,7 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
 
             current_position = tracker.current_restriction().start
             file_name = pathlib.Path(element.uri).name
-
+            yield pvalue.TaggedOutput('uri', element.uri)
             while tracker.try_claim(current_position):
                 end = tracker.current_restriction().stop
 
@@ -318,13 +344,13 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
 
                 # NOTE(bahmandar): This will return a list of dictionarys based on the shape
                 # of the dimensions. i.e. {time:0, longitude:0, latitude:0, depth:0},
-                # {time:0, longitude:3, latitude:2, depth:0}
+                # {time:1, longitude:10, latitude:2, depth:0}, {time:1, longitude:2, latitude:2, depth:0}
                 result = get_iterator_minimal(ds.sizes, current_position, end)
 
 
                 # NOTE(bahmandar): Turn the result above to a list of tuples
                 # [(longitude, 0),(longitude, 1),(depth, 0) ...]
-                result_tuple_list = [(k, v) for f in result for k,v in f.items()]
+                result_tuple_list = [(k, v) for f in result for k, v in f.items()]
                 # NOTE(bahmandar): This will give me the max and min of each dimensions
                 # as a dict {time:0, longitude:0, latitude:0, depth:0} and
                 #{time:1, longitude:740, latitude:1440, depth:20}
@@ -341,7 +367,6 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
                 sliced_ds_large = ds.isel(**output_dict, drop=True).compute()
 
                 for idx, item in enumerate(result, start=1):
-
                     row = {}
                     # NOTE(bahmandar): Need to add an offset because we are using
                     # sliced_ds_large instead of the original dataset
@@ -361,7 +386,7 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
 
                     if 'latitude' in row and 'longitude' in row:
                         row[GEO_POINT_COLUMN] = fetch_geo_point(row['latitude'], row['longitude'])
-                    yield row
+                    yield pvalue.TaggedOutput('data', row)
 
                     # NOTE(bahmandar): without this statement dataflow would give
                     # warnings of process has gone for xxx seconds without a response
@@ -369,6 +394,5 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
                     if (current_position + idx) >= end or not tracker.try_claim(current_position + idx):
                         break
                 t.stop()
-
                 current_position += end
 

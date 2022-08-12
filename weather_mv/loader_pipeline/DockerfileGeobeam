@@ -8,8 +8,14 @@ ENV CCACHE_DISABLE=1
 ENV PATH=$PATH:$WORKDIR/build/usr/local/bin
 ENV CLOUDSDK_PYTHON_SITEPACKAGES=1
 
+
+
+# SOME OF THESE WERE FOR GETTING METVIEW SOURCE TO WORK BUT NEVER DID
 RUN apt-get update -y \
-    && apt-get install libffi-dev git g++ make cmake automake pkg-config libeccodes-dev libeccodes-tools metview -y \
+    && apt-get install libffi-dev git g++ make cmake automake pkg-config \
+    libeccodes-dev libeccodes-tools metview=5.10.2-1 metview-data=5.10.2-1 \
+    libmetview0d=5.10.2-1 libmetview-dev=5.10.2-1 flex bison libgmp3-dev \
+    libpango1.0-dev libpango1.0-dev libpangocairo-1.0-0 gfortran -y \
     && apt-get clean
 
 ENV CURL_VERSION 7.83.1
@@ -72,6 +78,51 @@ RUN wget -q https://download.osgeo.org/gdal/${GDAL_VERSION}/gdal-${GDAL_VERSION}
     && echo "building GDAL ${GDAL_VERSION}..." \
     && cmake --build . && cmake --build . --target install \
     && cd $WORKDIR && rm -rf gdal-${GDAL_VERSION}.tar.gz gdal-${GDAL_VERSION}
+
+
+ENV HDF5_VERSION 1.10.5
+RUN wget -q https://support.hdfgroup.org/ftp/HDF5/current/src/hdf5-${HDF5_VERSION}.tar.gz \
+    && tar -xzf hdf5-${HDF5_VERSION}.tar.gz \
+    && cd hdf5-${HDF5_VERSION} \
+    && mkdir install \
+    && ./configure --prefix=/usr/local \
+#    && make check \
+    && make install \
+    && cd $WORKDIR && rm -rf hdf5-${HDF5_VERSION}.tar.gz hdf5-${HDF5_VERSION}
+
+ENV NETCDF_VERSION 4.9.0
+RUN wget -q https://downloads.unidata.ucar.edu/netcdf-c/${NETCDF_VERSION}/netcdf-c-${NETCDF_VERSION}.tar.gz \
+    && tar -xzf netcdf-c-${NETCDF_VERSION}.tar.gz \
+    && cd netcdf-c-${NETCDF_VERSION} \
+    && mkdir install \
+    && ./configure --prefix=/usr/local \
+#    && make check \
+    && make install \
+    && cd $WORKDIR && rm -rf netcdf-c-${NETCDF_VERSION}.tar.gz netcdf-c-${NETCDF_VERSION}
+
+
+# INSTALLING THIS WILL GET METVIEW BUT BREAK APACHE BEAM
+
+## Install miniconda
+#ENV CONDA_DIR /opt/conda
+#RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
+#     /bin/bash ~/miniconda.sh -b -p /opt/conda
+#
+#
+## Put conda in path so we can use conda activate
+#ENV PATH=$CONDA_DIR/bin:$PATH
+#
+#RUN conda config --set auto_activate_base false
+#
+#RUN conda install --no-deps -c conda-forge metview=5.16.0
+#RUN conda install --no-deps -c conda-forge eccodes=2.26.0
+
+
+# INSTALLING THIS WILL GET METVIEW BUT BREAK APACHE BEAM
+RUN mkdir -p /usr/share/metview/share
+RUN ln -s /usr/share/metview/*  /usr/share/metview/share/
+RUN ln -s /usr/lib/ /usr/share/metview/
+
 
 RUN ldconfig
 RUN pip install --upgrade pip

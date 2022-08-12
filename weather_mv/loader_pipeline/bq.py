@@ -34,6 +34,7 @@ from apache_beam.io.gcp.internal.clients import bigquery as bigquery_beam
 from xarray.core.utils import ensure_us_time_resolution
 import pathlib
 from .sinks import ToDataSink
+from .sinks import delete_remote_temp_file
 from apache_beam.typehints import Iterable
 from apache_beam.typehints import Tuple
 from apache_beam.io import fileio
@@ -41,13 +42,18 @@ import math
 from apache_beam.transforms import window
 from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
 from apache_beam.coders.coders import VarIntCoder
+from oauth2client.client import GoogleCredentials
+
 import time
 from .util import (
     to_json_serializable_type,
     validate_region,
     _only_target_vars,
     get_coordinates,
-    get_iterator_minimal
+    get_iterator_minimal,
+    clean_label_value,
+    get_user_email_from_credentials
+
 )
 from .transform_utils import (
     FanOut,
@@ -137,8 +143,7 @@ class ToBigQuery(ToDataSink):
     coordinate_chunk_size: int = 1_000_000
     table_schema: bigquery_beam.TableSchema = None
     project: str = None
-    enable_local_save: bool = False
-    skip_table_creation: bool = True
+    enable_local_save: bool = None
 
 
     @classmethod
@@ -171,7 +176,7 @@ class ToBigQuery(ToDataSink):
                                     'BigQuery. Used to tune parallel uploads.')
         subparser.add_argument('--disable_grib_schema_normalization', action='store_true', default=False,
                                help="To disable grib's schema normalization. Default: off")
-        subparser.add_argument('--enable_local_save', action='store_true', default=False,
+        subparser.add_argument('--enable_local_save', action='store_true', default=None,
                                help="To enable saving files to each vm Default: off")
 
     @classmethod
@@ -200,10 +205,13 @@ class ToBigQuery(ToDataSink):
     # NOTE(bahmandar): This will process all the schemas received from different
     # files
     def get_schema(self, sets):
+
         table_schema = []
         schema_fields = []
         elements = sets[1]
+        attrs_list = []
         for item in elements:
+            attrs_list.append(item.attrs)
             item_schema_names = [x.name for x in table_schema]
             for schema_field in item.schema:
                 if schema_field.name not in item_schema_names:
@@ -217,8 +225,29 @@ class ToBigQuery(ToDataSink):
         else:
             # Create the table in BigQuery
             try:
+                client = bigquery.Client()
                 table = bigquery.Table(self.output_table.replace(":","."), schema=table_schema)
-                table = bigquery.Client().create_table(table, exists_ok=True)
+                credentials = GoogleCredentials.get_application_default()
+                table = client.create_table(table, exists_ok=True)
+                unique_attrs = [k for j, k in enumerate(attrs_list) if k not in attrs_list[j + 1:]]
+                unique_attrs_dict = {k: v for d in unique_attrs for k, v in d.items()}
+
+
+                labels = {}
+                print(unique_attrs_dict)
+                for key, value in unique_attrs_dict.items():
+                    labels[clean_label_value(key)] = clean_label_value(value)
+
+                labels['system'] = 'weather-mv'
+                user_email = get_user_email_from_credentials(credentials)
+                if user_email:
+                    labels['user'] = clean_label_value(user_email)
+                labels['server_account_email'] = clean_label_value(client.get_service_account_email())
+
+                table.labels = labels
+                table = client.update_table(table, ["labels"])  # API request
+                table.description = json.dumps(unique_attrs_dict, indent=1)
+                table = client.update_table(table, ["description"])
             except Exception as e:
                 logger.error(f'Unable to create table in BigQuery: {e}')
                 raise
@@ -282,9 +311,38 @@ class ToBigQuery(ToDataSink):
             # individually and then grouped together in rows based on the unique
             # coords (which was the key)
             # | 'Add Window Per File' >> WindowPerFile()
+
             # | 'Group by Key' >> beam.GroupByKey()
             # | 'Format Records' >> beam.Map(format_records)
+
         )
+
+
+        # prepared_files = (
+        #   paths
+        #   | 'Add Constant Key To URIs' >> beam.Map(lambda v: (0, v))
+        #   | 'Group URIs' >> beam.GroupByKey()
+        #   | 'Prepare Group' >> beam.Map(self.get_schema)
+        #   | 'FanOut' >>
+        #   # NOTE(bahmandar): PrepareFile dataclass variables are being filled
+        #   # with what is in the ToBigQuery class
+        #   | 'Prepare Files' >> beam.ParDo(PrepareFiles(*(dataclasses.asdict(self).get(k.name) for k in dataclasses.fields(PrepareFiles))))
+        #   # NOTE(bahmandar): shuffled in case of fusion. Might not be needed
+        #   | 'Shuffle' >> beam.Reshuffle()
+        #
+        #   # NOTE(bahmandar): the three transforms below are not utilized anymore
+        #   # this was used if each variable in the file was processed by itself
+        #   # individually and then grouped together in rows based on the unique
+        #   # coords (which was the key)
+        #   | 'Add Window Per File' >> WindowPerFile()
+        #
+        #   # | 'Group by Key' >> beam.GroupByKey()
+        #   # | 'Format Records' >> beam.Map(format_records)
+        #
+        # )
+
+
+
         # NOTE(bahmandar): a "schema" is created for each file and then turned into
         # a list
         schema = beam.pvalue.AsList(
@@ -296,17 +354,24 @@ class ToBigQuery(ToDataSink):
         )
 
         extracted_rows = (
-            prepared_files | 'Process Files' >> beam.ParDo(ProcessFiles())
+            prepared_files | 'Process Files' >> beam.ParDo(ProcessFiles()).with_outputs()
         )
 
+        # NOTE(bahmandar): This was not done in teardown because other dofns
+        # could still be using the gcs temp files
+        (
+          extracted_rows.uri
+          | 'Dedupe Uris' >> beam.Distinct()
+          | 'Clean Remote Temp Files' >> beam.Map(lambda x: delete_remote_temp_file(x, self.temp_gcs_location))
+        )
 
         if not self.dry_run:
             (
-                    extracted_rows
+                    extracted_rows.data
                     | 'WriteToBigQuery' >> WriteToBigQuery(
                         project=self.project,
                         table=self.output_table,
-                        schema=lambda element, side_input: bigquery_beam.TableSchema(fields=side_input[0]),
+                        schema=lambda table_info, side_input: bigquery_beam.TableSchema(fields=side_input[0]),
                         schema_side_inputs=(schema,),
                         method=WriteToBigQuery.Method.FILE_LOADS,
                         write_disposition=BigQueryDisposition.WRITE_APPEND,

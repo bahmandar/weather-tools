@@ -139,7 +139,7 @@ setup(
     version='0.2.3',
     url='https://weather-tools.readthedocs.io/en/latest/weather_mv/',
     description='A tool to load weather data into BigQuery.',
-    install_requires=base_requirements,
+    # install_requires=base_requirements,
     cmdclass={
         # Command class instantiated and run during pip install scenarios.
         'build': build,

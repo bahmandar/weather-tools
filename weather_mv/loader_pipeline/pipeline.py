@@ -121,7 +121,6 @@ def pipeline(known_args: argparse.Namespace,
                 (paths
                  | "MoveToBigQuery" >> ToBigQuery.from_kwargs(
                         temp_gcs_location=temp_gcs_location,
-                        skip_table_creation=True,
                         **vars(known_args))
                  )
             elif known_args.subcommand == 'regrid' or known_args.subcommand == 'rg':

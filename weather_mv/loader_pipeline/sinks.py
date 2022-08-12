@@ -23,7 +23,8 @@ import typing as t
 import os
 import io
 import apache_beam.io.gcp.gcsio
-import xarray.backends.cfgrib_
+import xarray
+
 from pyproj import Transformer
 import numpy as np
 import datetime
@@ -41,17 +42,23 @@ from urllib.parse import urlparse
 import pathlib
 from apache_beam.io.filesystem import CompressionTypes
 from cfgrib.dataset import DatasetBuildError
-from rasterio.io import MemoryFile
 from hashlib import sha256
 from codetiming import Timer
+import time
 import fsspec
 import subprocess
+import threading
+
 from .util import (
     DEFAULT_COORD_KEYS,
     _only_target_vars,
     convert_size
 )
 import socket
+import tenacity
+import google.auth
+from zarr.errors import GroupNotFoundError
+CREDS, PROJECT = google.auth.default()
 CUSTOM_READ_BUFFER_SIZE = 1 * (1 << 20)
 HOSTNAME = socket.gethostname()
 TIF_TRANSFORM_CRS_TO = "EPSG:4326"
@@ -240,7 +247,7 @@ def __open_dataset_file(
   backend_kwargs: t.Optional[t.Dict] = None) -> xr.Dataset:
 
     # NOTE(bahmandar): checks if file is a cfgrib to be used in for loop
-    cfgrib_backend = xarray.backends.cfgrib_.CfgribfBackendEntrypoint()
+    cfgrib_backend = xr.backends.cfgrib_.CfgribfBackendEntrypoint()
     cfgrib_exists = cfgrib_backend.available
     """Opens the dataset at 'uri' and returns a xarray.Dataset."""
 
@@ -313,7 +320,8 @@ def has_temp_dir():
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             return True
-    except (RuntimeError, FileNotFoundError):
+    # NOTE(bahmandar): OSError to catch disk full as well
+    except (RuntimeError, FileNotFoundError, OSError):
         return False
 
 
@@ -334,7 +342,64 @@ def log_subprocess_output(pipe):
     for line in iter(pipe.readline, ''): # b'\n'-separated lines
         line_output = line.strip()
         if line_output:
-            logger.info(f'subprocess: {line_output}')
+            logger.info(f'TTT {HOSTNAME}: subprocess: {line_output}')
+
+
+def delete_local_file(uri):
+    if has_temp_dir():
+        local_file_location = uri_to_filepath(uri, tempfile.gettempdir())
+        t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+        t.start()
+        try:
+            FileSystems.delete([local_file_location])
+            t.name = f'TTT {HOSTNAME}: Deleted Local File: {local_file_location}'
+            t.stop()
+        except beam.io.filesystem.BeamIOError:
+            pass
+
+
+def delete_local_based_on_time(local_file_location, modification_time):
+    if modification_time == os.stat(local_file_location).st_mtime:
+        try:
+            os.remove(local_file_location)
+        except FileNotFoundError:
+            pass
+
+
+
+def get_system_free_size():
+    temp_dir = pathlib.Path(tempfile.gettempdir())
+    statvfs = os.statvfs(temp_dir)
+    # NOTE(bahmandar): actual disk space used (sparse files will be logical not physical)
+    disk_space_available = statvfs.f_frsize * statvfs.f_bavail
+    # NOTE(bahmandar): This shows the result from du
+    temp_used_artificial = sum(f.stat().st_size for f in temp_dir.glob('**/*') if f.is_file())
+    # NOTE(bahmandar): This shows the result from ls
+    temp_used_actual = sum(f.stat().st_blocks*512 for f in temp_dir.glob('**/*') if f.is_file())
+    return disk_space_available - temp_used_actual + temp_used_artificial
+
+
+# NOTE(bahmandar): now when dealing with local save it will wait and retry again
+# later
+@tenacity.retry(
+  wait=tenacity.wait_random_exponential(multiplier=0.5, max=60),
+  stop=(tenacity.stop_after_delay(30 * 60)), #| tenacity.stop_after_attempt(100)
+  before_sleep=tenacity.before_sleep_log(logger, logging.INFO),
+  after=tenacity.after_log(logger, logging.INFO),
+  retry_error_callback=lambda retry_state: False)
+def space_available(source_file_size=None):
+    disk_space_available = get_system_free_size()
+    if source_file_size * 1.5 > disk_space_available:
+        logger.info(f'TTT {HOSTNAME}: no disk space will try again later, disk space: {disk_space_available}, source file: {source_file_size}')
+        raise Exception('No Disk Space Left. Still Retrying')
+    else:
+        logger.info(f'TTT {HOSTNAME}: has disk space will not try again later, disk space: {disk_space_available}, source file: {source_file_size}')
+        return True
+
+
+def get_uri_size(uri):
+    with FileSystems.open(uri) as remote_file:
+        return get_buffer_size(remote_file)
 
 
 @contextlib.contextmanager
@@ -342,29 +407,20 @@ def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[
     t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
     t.start()
     if has_temp_dir():
-        # with tempfile.TemporaryDirectory() as temp_dir:
-        with tempfile.NamedTemporaryFile() as local_file_location:
-            # local_file_location = uri_to_filepath(uri, temp_dir)
-            # NOTE(bahmandar): This is really not used anymore because of using tempfile
-            # if not FileSystems.exists(local_file_location) or ignore_existing:
+        local_file_location = uri_to_filepath(uri, tempfile.gettempdir())
+        if not FileSystems.exists(local_file_location) or ignore_existing:
             with FileSystems.create(local_file_location) as dest_file:
-                result = subprocess.run(f'gsutil du -s {uri}',
-                                        shell=True,
-                                        capture_output=True,
-                                        text=True)
-                if result.returncode != 0 and (source_file_size := int(result.stdout.split()[0]) == 0):
-                    logger.warning(result.stdout)
-                    logger.warning(result.stderr)
+                source_file_size = get_uri_size(uri)
+                if not space_available(source_file_size=source_file_size):
+                    disk_space_available = get_system_free_size()
+                    logger.warning(f'Short on Disk Space - Available: {convert_size(disk_space_available)} File: {convert_size(source_file_size)}')
                     yield None
                 else:
-                    source_file_size = int(result.stdout.split()[0])
-                    statvfs = os.statvfs(tempfile.gettempdir())
-                    disk_space_available = statvfs.f_frsize * statvfs.f_bavail
-                    # source_file_size = 1000 * (1 << 30)
-                    if source_file_size * 1.5 > disk_space_available:
-                        logger.warning(f'Short on Disk Space - Available: {convert_size(disk_space_available)} File: {convert_size(source_file_size)}')
-                        yield None
-                    else:
+
+                    # NOTE(bahmandar): creates blank file to pre-allocate space
+                    # one issue is that gcloud ran out of space while downloading the file
+                    dest_file.truncate(source_file_size)
+                    try:
                         process = Popen(['gcloud', 'alpha', 'storage', 'cp', uri, dest_file.name], stdout=PIPE, stderr=STDOUT, universal_newlines=True)
                         with process.stdout:
                             log_subprocess_output(process.stdout)
@@ -379,25 +435,49 @@ def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[
                         dest_file.seek(0)
                         t.name = f'TTT {HOSTNAME}: Created Local GCS File: {dest_file.name}'
                         t.stop()
+                    except OSError as e:
+                        logger.warning(e)
+                        yield None
+                    try:
+                        modification_time = time.time()
+                        accessed_time = os.stat(local_file_location).st_atime
+                        os.utime(local_file_location, (accessed_time, modification_time))
                         yield dest_file.name
-            # NOTE(bahmandar): This is really not used anymore because of using tempfile
-            # else:
-            #
-            #     with FileSystems.open(local_file_location) as local_file:
-            #         with FileSystems.open(uri) as remote_file:
-            #             if get_buffer_size(local_file) == get_buffer_size(remote_file):
-            #                 t.name = f'TTT {HOSTNAME}: Reused Local GCS File: {local_file_location}'
-            #                 t.stop()
-            #                 yield local_file_location
-            #             else:
-            #                 # NOTES(bahmandar): Need to test this out again
-            #                 t.name = f'TTT {HOSTNAME}: Deleted Corrupted File: {local_file_location}'
-            #                 t.stop()
-            #                 yield open_local_gcs(uri, True)
+                        file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
+                        file_erase.start()
+                    except FileNotFoundError as e:
+                        logger.warning(f'{HOSTNAME}: {e} ')
+                        yield None
+        else:
+            with FileSystems.open(local_file_location) as local_file:
+                with FileSystems.open(uri) as remote_file:
+                    if get_buffer_size(local_file) == get_buffer_size(remote_file):
+                        t.name = f'TTT {HOSTNAME}: Reused Local GCS File: {local_file_location}'
+                        t.stop()
+                        modification_time = time.time()
+                        accessed_time = os.stat(local_file_location).st_atime
+                        # NOTE(bahmandar): changes modification time. Didn't find
+                        # any good way to share this fail between threads and workers
+                        # they were re-downloading again which I wanted to stop
+                        os.utime(local_file_location, (accessed_time, modification_time))
+                        yield local_file_location
+                        # NOTE(bahmandar): If no other thread/process picks this up
+                        # it will be deleted in 60 seconds
+                        file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
+                        file_erase.start()
+                    else:
+                        # NOTES(bahmandar): Need to test this out again. UNTESTED
+                        t.name = f'TTT {HOSTNAME}: Deleted Corrupted File: {local_file_location}'
+                        t.stop()
+                        yield open_local_gcs(uri, True)
+
     else:
         yield None
 
 
+# TODO(ALI) update this if mod thing works
+# NOTE(bahmandar): Focus was on GCS usage but cleaning this up if need is a good
+# next step
 @contextlib.contextmanager
 def open_local(uri: str) -> t.ContextManager[str]:
     """Copy a cloud object (e.g. a netcdf, grib, or tif file) from cloud storage, like GCS, to local file."""
@@ -407,7 +487,7 @@ def open_local(uri: str) -> t.ContextManager[str]:
         # with tempfile.TemporaryDirectory() as temp_dir:
         with tempfile.NamedTemporaryFile() as local_file_location:
             # local_file_location = uri_to_filepath(uri, temp_dir)
-            with FileSystems().create(local_file_location) as dest_file:
+            with FileSystems().create(local_file_location.name) as dest_file:
                 shutil.copyfileobj(source_file, dest_file, DEFAULT_READ_BUFFER_SIZE)
                 dest_file.flush()
                 dest_file.seek(0)
@@ -415,23 +495,66 @@ def open_local(uri: str) -> t.ContextManager[str]:
                 t.stop()
                 yield dest_file.name
 
+
+def temp_zarr_exists(bucket_name, prefix):
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
+    return next(blobs, None) is not None
+
+# NOTE(bahmandar): not currently used, but this was needed cause fsspec would give
+# OSError
+@tenacity.retry(
+  wait=tenacity.wait_random_exponential(multiplier=0.5, max=10),
+  stop=(tenacity.stop_after_attempt(3)),
+  before_sleep=tenacity.before_sleep_log(logger, logging.INFO),
+  after=tenacity.after_log(logger, logging.INFO))
+def get_fsspec_mapper(url, check=True):
+    return fsspec.get_mapper(url=url, check=False)
+
 # NOTE(bahmandar): Gets subset if possible. returns nothing otherwise
-def get_dataset(bucket_name: str, prefix: str) -> t.Union[xarray.Dataset, None]:
-    try:
-        mapper = fsspec.get_mapper(url=f'gs://{bucket_name}/{prefix}', check=True)
-        t = Timer(name=f'TTT {HOSTNAME}: Received Dataset: gs://{bucket_name}/{prefix}', text='{name}: {:.2f} seconds', logger=logger.info)
-        t.start()
-        ds = xarray.open_zarr(store=mapper)
+@contextlib.contextmanager
+def get_dataset(bucket_name: str,
+                prefix: str) -> t.ContextManager[xarray.Dataset]:
+    t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
+    t.start()
+    if temp_zarr_exists(bucket_name, prefix):
+        try:
+            # NOTE(bahmandar): both of the options below worked fine. No significant
+            # speed difference for the one test
+            open_dataset_kwargs = {'cache': False}
+            with xr.open_dataset(
+              f"gcs://{bucket_name}/{prefix}", **open_dataset_kwargs,
+              backend_kwargs={
+                "storage_options": {"project": PROJECT, "token": CREDS.token}
+              },
+              engine="zarr",
+            ) as ds:
+                t.name = f'TTT {HOSTNAME}: Received Dataset: gs://{bucket_name}/{prefix}'
+                t.stop()
+                yield ds
+
+            # mapper = get_fsspec_mapper(url=f'gs://{bucket_name}/{prefix}', check=True)
+            # with xr.open_zarr(store=mapper) as ds:
+            #     t.name = f'TTT {HOSTNAME}: Received Dataset: gs://{bucket_name}/{prefix}'
+            #     t.stop()
+            #     yield ds
+        except GroupNotFoundError as e:
+            # logger.warning(type(e).__name__, e.args)
+            yield None
+    else:
+        t.name = f'TTT {HOSTNAME}: Dataset Not Found: gs://{bucket_name}/{prefix}'
         t.stop()
-    except ValueError as e:
-        # template = "An exception of type {0} occurred. Arguments:\n{1!r}"
-        # logger.warning(template.format(type(e).__name__, e.args))
-        ds = None
-    return ds
+        yield None
 
 
 # NOTE(bahmandar): saves subset as zarr for future workers to use.
-def save_dataset(ds: xarray.Dataset, bucket_name: str, prefix: str) -> None:
+@tenacity.retry(
+  wait=tenacity.wait_random_exponential(multiplier=0.5, max=10),
+  stop=(tenacity.stop_after_delay(5 * 60) | tenacity.stop_after_attempt(50)), #
+  before_sleep=tenacity.before_sleep_log(logger, logging.INFO),
+  after=tenacity.after_log(logger, logging.INFO))
+def save_dataset(ds: xr.Dataset, bucket_name: str, prefix: str) -> None:
     t = Timer(name=f'TTT {HOSTNAME}: Created Dataset: gs://{bucket_name}/{prefix}', text='{name}: {:.2f} seconds', logger=logger.info)
     t.start()
     mapper = fsspec.get_mapper(url=f'gs://{bucket_name}/{prefix}', create=True)
@@ -439,6 +562,25 @@ def save_dataset(ds: xarray.Dataset, bucket_name: str, prefix: str) -> None:
     logger.info(f'Dataset: gs://{bucket_name}/{prefix} Created')
     t.stop()
 
+
+def delete_remote_temp_file(uri, temp_gcs_location):
+    if temp_gcs_location:
+        bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
+        delete_dataset(bucket_name, prefix)
+
+
+def delete_remote_temp_files(uris, temp_gcs_location):
+    uris_deduped = list(set(uris))
+    for uri in uris_deduped:
+        if temp_gcs_location:
+            bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
+            delete_dataset(bucket_name, prefix)
+
+
+def delete_local_temp_files(uris):
+    uris_deduped = list(set(uris))
+    for uri in uris:
+        delete_local_file(uri)
 
 # NOTE(bahmandar): This is not needed anymore because we are using tempfile
 # if we weren't then we would need to delete manually created files
@@ -448,8 +590,15 @@ def delete_dataset(bucket_name: str, prefix: str) -> None:
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket_name)
     try:
-        blob = bucket.blob(prefix+'ds')
-        blob.delete()
+
+        blobs = bucket.list_blobs(prefix=prefix)
+        # NOTE(bahmandar): HTTPError if you don't turn it into list first
+        bucket.delete_blobs(blobs=list(blobs))
+
+        # NOTE(bahmandar): this is for single file and not folders which is what
+        # zarr is
+        # blob = bucket.blob(prefix)
+        # blob.delete()
         t.name = f'TTT {HOSTNAME}: Deleted Dataset: gs://{bucket_name}/{prefix}'
     except NotFound:
         t.name = f'TTT {HOSTNAME}: Nothing to Delete: gs://{bucket_name}/{prefix}'
@@ -491,7 +640,7 @@ def open_dataset(uri,
                  tif_metadata_for_datetime: t.Optional[str] = None,
                  area: t.Tuple[int, int, int, int] = None,
                  variables: t.List[str] = None,
-                 enable_local_save: bool = False,
+                 enable_local_save: bool = None,
                  temp_gcs_location: str = None,
                  run_rasterio: bool = False,
                  backend_kwargs: t.Optional[t.Dict] = None
@@ -501,22 +650,22 @@ def open_dataset(uri,
     try:
         # NOTE(bahmandar): if a temp gcs location was given and the zarr file
         # exists then use that
-        if temp_gcs_location:
-            bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
-            xr_dataset = get_dataset(bucket_name, prefix)
-        else:
-            xr_dataset = None
-
         with contextlib.ExitStack() as stack:
-            if xr_dataset:
+            xr_dataset = None
+            if temp_gcs_location:
+                bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
+                xr_dataset = stack.enter_context(get_dataset(bucket_name, prefix))
+            if xr_dataset is not None:
                 yield xr_dataset
             else:
                 # NOTE(bahmandar): check if scipy and prefer local save
-                scipy_backend = xarray.backends.scipy_.ScipyBackendEntrypoint()
+                # but only if local save was never set to begin with
+                scipy_backend = xr.backends.scipy_.ScipyBackendEntrypoint()
                 with FileSystems.open(uri) as f:
                     if scipy_backend.available and scipy_backend.guess_can_open(f):
-                        logger.info('Local save is preferred for this file type')
-                        enable_local_save = True
+                        if enable_local_save is None:
+                            logger.info('Local save is preferred for this file type')
+                            enable_local_save = True
 
                 # NOTE(bahmandar): try to local gcs save and if it fails then
                 # resort to remote open
@@ -559,7 +708,7 @@ def open_dataset(uri,
                 # NOTE(bahmandar): This is NOT TESTED and this will have to load everything into
                 # memory or have it available locally
                 if run_rasterio:
-                    with MemoryFile(uri_buffer) as memfile:
+                    with rasterio.io.MemoryFile(uri_buffer) as memfile:
                         with memfile.open() as dataset:
                             data_array = dataset.read()
                             dtype, crs, transform = (data_array.profile.get(key) for key in ['dtype', 'crs', 'transform'])
@@ -573,7 +722,12 @@ def open_dataset(uri,
                 if current_size < original_size * 0.25 and temp_gcs_location:
                     bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
                     save_dataset(xr_dataset, bucket_name, prefix)
-                    xr_dataset = get_dataset(bucket_name, prefix)
+                    # uri_buffer = stack.enter_context(get_dataset(bucket_name, prefix))
+                    xr_dataset = stack.enter_context(get_dataset(bucket_name, prefix))
+                    # if uri_buffer is not None:
+                    #     xr_dataset: xr.Dataset = __open_dataset_file(uri_buffer, f'gs://{bucket_name}/{prefix}', '.zarr', True, None, None)
+                    if xr_dataset is not None:
+                        delete_local_file(uri)
 
                 # NOTE(bahmandar): Permenantly not used cause it will have signifcant memory issues
                 # with large files (i.e. greater than 2GiB).

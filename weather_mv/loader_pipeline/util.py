@@ -39,7 +39,11 @@ from google.api_core.exceptions import NotFound
 from google.cloud import bigquery, storage
 from xarray.core.utils import ensure_us_time_resolution
 import math
+import re
 import socket
+from googleapiclient.discovery import build
+from googleapiclient import errors
+
 HOSTNAME = socket.gethostname()
 
 
@@ -52,6 +56,37 @@ CANARY_RECORD_FILE_NAME = 'canary_record.json'
 CANARY_OUTPUT_TABLE_SUFFIX = '_anthromet_canary_table'
 CANARY_TABLE_SCHEMA = [bigquery.SchemaField('name', 'STRING', mode='NULLABLE')]
 DEFAULT_COORD_KEYS = frozenset(('latitude', 'time', 'step', 'valid_time', 'longitude', 'number'))
+
+
+def get_user_email_from_credentials(credentials):
+    user_info_service = build(
+      serviceName='oauth2', version='v2',
+      credentials=credentials, cache_discovery=False)
+    user_info = None
+    try:
+        user_info = user_info_service.userinfo().get().execute()
+    except errors.HttpError as e:
+        logging.error('An error occurred: %s', e)
+    if user_info and user_info.get('id'):
+        return user_info['email']
+    else:
+        return None
+
+
+def clean_label_value(label_value):
+    """
+    GCP Label values have to follow strict guidelines
+        Keys and values can only contain lowercase letters, numeric characters, underscores,
+        and dashes. International characters are allowed.
+    https://cloud.google.com/compute/docs/labeling-resources#restrictions
+    :param label_value: label value that needs to be cleaned up
+    :return: cleaned label value
+    """
+    # to solve when attrs is False boolean
+    if not isinstance(label_value, str):
+        label_value = str(label_value)
+    full_pattern = re.compile(r'[^\-\w]')
+    return re.sub(full_pattern, '-', label_value).lower()[:63]
 
 
 def to_json_serializable_type(value: t.Any) -> t.Any:
