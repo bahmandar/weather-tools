@@ -1,0 +1,71 @@
+{
+  "description": "Pipeline to Process Climate Data",
+  "name": "Weather MV",
+  "parameters": [
+    {
+      "regexes": [
+        "^gs:\\/\\/[^\\n\\r]+$"
+      ],
+      "name": "uris",
+      "helpText": "Input URL file pattern glob",
+      "label": "Input Cloud Storage file(s)",
+      "isOptional": false
+    },
+    {
+      "name": "output_table",
+      "helpText": "Full name of destination BigQuery table. Ex: my_project:my_dataset.my_table",
+      "label": "Bigquery table to put the results",
+      "isOptional": false
+    },
+    {
+      "name": "variables",
+      "helpText": "Target variables (or coordinates) for the BigQuery schema. Default: will import all data variables as columns.",
+      "label": "Variables to keep",
+      "isOptional": true
+    },
+    {
+      "name": "area",
+      "helpText": "Target area in [N, W, S, E]. Default: Will include all available area.",
+      "label": "Target area in [N, W, S, E]",
+      "isOptional": true
+    },
+    {
+      "name": "coordinate_chunk_size",
+      "helpText": "this will dictate how fast beam will parallelize the splittable dofn",
+      "label": "Intial splitting value",
+      "isOptional": true
+    },
+    {
+      "name": "skip_region_validation",
+      "helpText": "Skip validation of regions for data migration. Default: off",
+      "label": "Skip Region Validation",
+      "isOptional": true
+    },
+    {
+      "name": "enable_local_save",
+      "helpText": "To enable saving files to each vm Default: off",
+      "label": "Enable Local Save",
+      "isOptional": true
+    },
+    {
+      "name": "infer_schema",
+      "helpText": "Download one file in the URI pattern and infer a schema from that file. Default: off",
+      "label": "Infer Schema",
+      "isOptional": true
+    },
+    {
+      "name": "public_ips",
+      "helpText": "Set true to enable public ip usage. Default: off",
+      "label": "Public ips",
+      "isOptional": true
+    }
+  ]
+}
+
+
+
+
+
+
+
+

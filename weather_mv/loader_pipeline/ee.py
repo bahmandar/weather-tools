@@ -217,8 +217,8 @@ class ToEarthEngine(ToDataSink):
                                help='Maximum concurrent api requests to EE allowed for your project. Default: 10')
 
     @classmethod
-    def validate_arguments(cls, known_args: argparse.Namespace, pipeline_args: t.List[str]) -> None:
-        pipeline_options = PipelineOptions(pipeline_args)
+    def validate_arguments(cls, known_args: t.Any, pipeline_options: PipelineOptions) -> None:
+
         pipeline_options_dict = pipeline_options.get_all_options()
 
         # Check that ee_asset is in correct format.

@@ -52,7 +52,8 @@ from .util import (
     get_coordinates,
     get_iterator_minimal,
     clean_label_value,
-    get_user_email_from_credentials
+    get_user_email_from_credentials,
+    str2bool
 
 )
 from .transform_utils import (
@@ -159,31 +160,33 @@ class ToBigQuery(ToDataSink):
         subparser.add_argument('--import_time', type=str, default=datetime.datetime.utcnow().isoformat(),
                                help=("When writing data to BigQuery, record that data import occurred at this "
                                      "time (format: YYYY-MM-DD HH:MM:SS.usec+offset). Default: now in UTC."))
-        subparser.add_argument('--infer_schema', action='store_true', default=False,
+        subparser.add_argument('--infer_schema', type=str2bool, nargs='?', const=True, default=False,
                                help='Download one file in the URI pattern and infer a schema from that file. Default: '
                                     'off')
-        subparser.add_argument('--xarray_open_dataset_kwargs', type=json.loads, default='{}',
+        subparser.add_argument('--xarray_open_dataset_kwargs', type=json.loads, default=None,
                                help='Keyword-args to pass into `xarray.open_dataset()` in the form of a JSON string.')
-        subparser.add_argument('--disable_in_memory_copy', action='store_true', default=False,
+        subparser.add_argument('--disable_in_memory_copy', type=str2bool, nargs='?', const=True, default=False,
                                help="To disable in-memory copying of dataset. Default: False")
         subparser.add_argument('--tif_metadata_for_datetime', type=str, default=None,
                                help='Metadata that contains tif file\'s timestamp. '
                                     'Applicable only for tif files.')
-        subparser.add_argument('-s', '--skip-region-validation', action='store_true', default=False,
+        subparser.add_argument('-s', '--skip_region_validation', type=str2bool, nargs='?', const=True, default=False,
                                help='Skip validation of regions for data migration. Default: off')
         subparser.add_argument('--coordinate_chunk_size', type=int, default=100_000,
                                help='The size of the chunk of coordinates used for extracting vector data into '
                                     'BigQuery. Used to tune parallel uploads.')
-        subparser.add_argument('--disable_grib_schema_normalization', action='store_true', default=False,
+        subparser.add_argument('--disable_grib_schema_normalization', type=str2bool, nargs='?', const=True, default=False,
                                help="To disable grib's schema normalization. Default: off")
-        subparser.add_argument('--enable_local_save', action='store_true', default=None,
+        subparser.add_argument('--enable_local_save', type=str2bool, nargs='?', const=True, default=False,
                                help="To enable saving files to each vm Default: off")
+        subparser.add_argument('--public_ips', type=str2bool, nargs='?', const=True, default=False,
+                               help="To enable the use of public ips Default: off")
 
     @classmethod
-    def validate_arguments(cls, known_args: argparse.Namespace, pipeline_args: t.List[str]) -> None:
-        pipeline_options = PipelineOptions(pipeline_args)
+    def validate_arguments(cls, known_args: t.Any, pipeline_options: PipelineOptions) -> None:
+
         pipeline_options_dict = pipeline_options.get_all_options()
-        
+
         if known_args.area:
             assert len(known_args.area) == 4, 'Must specify exactly 4 lat/long values for area: N, W, S, E boundaries.'
 

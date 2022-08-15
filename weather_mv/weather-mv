@@ -20,13 +20,17 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import pathlib
 
-import weather_mv
+# import weather_mv
 
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO)
+    # NOTE(bahmandar): getting path below to resolve pickling error
+    # site_pkg = weather_mv.__path__[0]
 
-    site_pkg = weather_mv.__path__[0]
+    site_pkg = pathlib.Path(__file__).parent.resolve()
+
 
     try:
         from loader_pipeline import cli
@@ -50,25 +54,29 @@ if __name__ == '__main__':
     if '-h' in sys.argv or '--help' in sys.argv or len(sys.argv) == 1:
         cli()
     else:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            original_dir = os.getcwd()
+        # NOTE(bahmandar): this was added to not reinstall the package everytime
+        if os.environ.get('FLEX_TEMPLATE_PYTHON_EXTRA_PACKAGES'):
+            cli()
+        else:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                original_dir = os.getcwd()
 
-            # Convert subpackage to a tarball
-            os.chdir(site_pkg)
-            subprocess.check_call(
-                f'{sys.executable} ./setup.py -q sdist --dist-dir {tmpdir}'.split(),
-            )
+                # Convert subpackage to a tarball
+                os.chdir(site_pkg)
+                subprocess.check_call(
+                    f'{sys.executable} ./setup.py -q sdist --dist-dir {tmpdir}'.split(),
+                )
 
-            os.chdir(original_dir)
+                os.chdir(original_dir)
 
-            # Set tarball as extra packages for Beam.
-            pkg_archive = glob.glob(os.path.join(tmpdir, '*.tar.gz'))[0]
+                # Set tarball as extra packages for Beam.
+                pkg_archive = glob.glob(os.path.join(tmpdir, '*.tar.gz'))[0]
 
-            with tarfile.open(pkg_archive, 'r') as tar:
-                assert any([f.endswith('.py') for f in tar.getnames()]), 'extra_package must include python files!'
+                with tarfile.open(pkg_archive, 'r') as tar:
+                    assert any([f.endswith('.py') for f in tar.getnames()]), 'extra_package must include python files!'
 
-            # cleanup memory to prevent pickling error.
-            tar = None
-            weather_mv = None
+                # cleanup memory to prevent pickling error.
+                # tar = None
+                # weather_mv = None
 
-            cli(['--extra_package', pkg_archive])
+                cli(['--extra_package', pkg_archive])

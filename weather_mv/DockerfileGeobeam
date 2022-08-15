@@ -9,14 +9,17 @@ ENV PATH=$PATH:$WORKDIR/build/usr/local/bin
 ENV CLOUDSDK_PYTHON_SITEPACKAGES=1
 
 
-
 # SOME OF THESE WERE FOR GETTING METVIEW SOURCE TO WORK BUT NEVER DID
 RUN apt-get update -y \
-    && apt-get install libffi-dev git g++ make cmake automake pkg-config \
-    libeccodes-dev libeccodes-tools metview=5.10.2-1 metview-data=5.10.2-1 \
-    libmetview0d=5.10.2-1 libmetview-dev=5.10.2-1 flex bison libgmp3-dev \
-    libpango1.0-dev libpango1.0-dev libpangocairo-1.0-0 gfortran -y \
+    && apt-get install libffi-dev git g++ gfortran make cmake automake \
+    pkg-config flex bison libeccodes-dev libeccodes-tools metview=5.10.2-1 \
+    metview-data=5.10.2-1 libmetview0d=5.10.2-1 libmetview-dev=5.10.2-1 -y \
     && apt-get clean
+
+# Fixes the metview issue with debian
+RUN mkdir -p /usr/share/metview/share
+RUN ln -s /usr/share/metview/*  /usr/share/metview/share/
+RUN ln -s /usr/lib/ /usr/share/metview/
 
 ENV CURL_VERSION 7.83.1
 RUN wget -q https://curl.haxx.se/download/curl-${CURL_VERSION}.tar.gz \
@@ -65,21 +68,6 @@ RUN wget -q -O openjpeg-${OPENJPEG_VERSION}.tar.gz https://github.com/uclouvain/
     && make --quiet -j$(nproc) && make --quiet install \
     && cd $WORKDIR && rm -rf openjpeg-${OPENJPEG_VERSION}.tar.gz openjpeg-${OPENJPEG_VERSION}
 
-ENV GDAL_VERSION 3.5.1
-RUN wget -q https://download.osgeo.org/gdal/${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz \
-    && tar -xzf gdal-${GDAL_VERSION}.tar.gz && cd gdal-${GDAL_VERSION} \
-    && mkdir build && cd build \
-    && cmake .. -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_INSTALL_PREFIX=/usr/local \
-    -DGDAL_USE_CURL=OFF \
-    -DGDAL_USE_GEOS=ON \
-    -DGEOS_INCLUDE_DIR=/usr/local/include/ \
-    -DGEOS_LIBRARY=/usr/local/lib/ \
-    && echo "building GDAL ${GDAL_VERSION}..." \
-    && cmake --build . && cmake --build . --target install \
-    && cd $WORKDIR && rm -rf gdal-${GDAL_VERSION}.tar.gz gdal-${GDAL_VERSION}
-
-
 ENV HDF5_VERSION 1.10.5
 RUN wget -q https://support.hdfgroup.org/ftp/HDF5/current/src/hdf5-${HDF5_VERSION}.tar.gz \
     && tar -xzf hdf5-${HDF5_VERSION}.tar.gz \
@@ -95,42 +83,40 @@ RUN wget -q https://downloads.unidata.ucar.edu/netcdf-c/${NETCDF_VERSION}/netcdf
     && tar -xzf netcdf-c-${NETCDF_VERSION}.tar.gz \
     && cd netcdf-c-${NETCDF_VERSION} \
     && mkdir install \
-    && ./configure --prefix=/usr/local \
+    && ./configure --prefix=/usr/local -disable-dap \
 #    && make check \
     && make install \
     && cd $WORKDIR && rm -rf netcdf-c-${NETCDF_VERSION}.tar.gz netcdf-c-${NETCDF_VERSION}
 
-
-# INSTALLING THIS WILL GET METVIEW BUT BREAK APACHE BEAM
-
-## Install miniconda
-#ENV CONDA_DIR /opt/conda
-#RUN wget --quiet https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh && \
-#     /bin/bash ~/miniconda.sh -b -p /opt/conda
-#
-#
-## Put conda in path so we can use conda activate
-#ENV PATH=$CONDA_DIR/bin:$PATH
-#
-#RUN conda config --set auto_activate_base false
-#
-#RUN conda install --no-deps -c conda-forge metview=5.16.0
-#RUN conda install --no-deps -c conda-forge eccodes=2.26.0
-
-
-# INSTALLING THIS WILL GET METVIEW BUT BREAK APACHE BEAM
-RUN mkdir -p /usr/share/metview/share
-RUN ln -s /usr/share/metview/*  /usr/share/metview/share/
-RUN ln -s /usr/lib/ /usr/share/metview/
-
+ENV GDAL_VERSION 3.5.1
+RUN wget -q https://download.osgeo.org/gdal/${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz \
+    && tar -xzf gdal-${GDAL_VERSION}.tar.gz && cd gdal-${GDAL_VERSION} \
+    && mkdir build && cd build \
+    && cmake .. -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DGDAL_USE_CURL=ON \
+    -DGDAL_USE_SQLITE3=ON \
+    -DGDAL_USE_GEOS=ON \
+    -DGDAL_USE_TIFF_INTERNAL=ON \
+    -DGDAL_USE_GEOTIFF_INTERNAL=ON \
+    -DGEOS_INCLUDE_DIR=/usr/local/include/ \
+    -DGEOS_LIBRARY=/usr/local/lib/ \
+    && echo "building GDAL ${GDAL_VERSION}..." \
+    && cmake --build . && cmake --build . --target install \
+    && cd $WORKDIR && rm -rf gdal-${GDAL_VERSION}.tar.gz gdal-${GDAL_VERSION}
 
 RUN ldconfig
-RUN pip install --upgrade pip
-RUN pip install gdal==$GDAL_VERSION
+
 COPY requirements.txt ${WORKDIR}/requirements.txt
-RUN pip install --upgrade pip
-RUN pip install --force-reinstall -r ${WORKDIR}/requirements.txt
+
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --force-reinstall --no-cache-dir -r ${WORKDIR}/requirements.txt \
+    # Download the requirements to speed up launching the Dataflow job. \
+    && pip download --no-cache-dir --dest /tmp/dataflow-requirements-cache -r ${WORKDIR}/requirements.txt \
+    && pip install --force-reinstall gdal[numpy]==$GDAL_VERSION \
+    && pip install --force-reinstall apache-beam[gcp]==2.40.0
+
 #https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
 RUN $(gcloud info --format="value(basic.python_location)") -m pip install numpy
-RUN gcloud components install alpha
-RUN gcloud components update --version=395.0.0
+RUN gcloud components install --quiet alpha
+RUN gcloud components update --quiet --version=395.0.0

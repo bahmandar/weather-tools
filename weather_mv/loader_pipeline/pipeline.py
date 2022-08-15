@@ -23,10 +23,14 @@ import typing as t
 import apache_beam as beam
 from apache_beam.io.filesystems import FileSystems
 from apache_beam.pipeline import PipelineOptions
+from apache_beam.options.pipeline_options import WorkerOptions
+from apache_beam.options.pipeline_options import StandardOptions
 from .bq import ToBigQuery
 from .ee import ToEarthEngine
 from .regrid import Regrid
 from .streaming import GroupMessagesByFixedWindows, ParsePaths
+from .loader_pipeline_options import LoaderPipelineOptions
+
 
 # NOTE(bahmandar): the below portion is cause I have a hard time seeing the logs on mac
 # terminal when running. This will color each line (more) distinctly
@@ -81,14 +85,20 @@ def pattern_to_uris(match_pattern: str) -> t.Iterable[str]:
         yield from [x.path for x in match.metadata_list]
 
 
-def pipeline(known_args: argparse.Namespace,
-             pipeline_args: t.List[str]) -> None:
+def pipeline(known_args: LoaderPipelineOptions,
+             pipeline_options: PipelineOptions) -> None:
     all_uris = list(pattern_to_uris(known_args.uris))
     if not all_uris:
         raise FileNotFoundError(
             f'File prefix "{known_args.uris}" matched no objects')
+    known_args_dict = known_args.get_all_options()
 
-    with beam.Pipeline(argv=pipeline_args) as p:
+    with beam.Pipeline(options=pipeline_options) as p:
+        # Validate subcommand
+        if known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq':
+            ToBigQuery.validate_arguments(known_args, pipeline_options)
+        elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':
+            ToEarthEngine.validate_arguments(known_args, pipeline_options)
         if known_args.topic:
             paths = (
                 p
@@ -111,81 +121,62 @@ def pipeline(known_args: argparse.Namespace,
 
             # NOTE(bahmandar): will use temp_gcs_location to store a temp zarr when the 
             # data is filtered
-            p_options = PipelineOptions(pipeline_args).get_all_options()
+            p_options = pipeline_options.get_all_options()
             if temp_gcs_location := p_options.get('temp_location'):
                 job_name = p_options.get('job_name', 'beam')
                 temp_gcs_location = os.path.join(temp_gcs_location,
                                                  f'{job_name}.{time.time()}')
-
+            logger.info(f'KNOWN ARGS: {known_args}')
+            logger.info(f'subcommand: {known_args.subcommand}')
             if (known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq'):
                 (paths
                  | "MoveToBigQuery" >> ToBigQuery.from_kwargs(
                         temp_gcs_location=temp_gcs_location,
-                        **vars(known_args))
+                        **known_args_dict)
                  )
             elif known_args.subcommand == 'regrid' or known_args.subcommand == 'rg':
-                paths | "Regrid" >> Regrid.from_kwargs(**vars(known_args))
+                paths | "Regrid" >> Regrid.from_kwargs(**known_args_dict)
             elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':
-                paths | "MoveToEarthEngine" >> ToEarthEngine.from_kwargs(**vars(known_args))
+                paths | "MoveToEarthEngine" >> ToEarthEngine.from_kwargs(**known_args_dict)
             else:
                 raise ValueError('invalid subcommand!')
 
     logger.info('Pipeline is finished.')
 
 
-def run(argv: t.List[str]) -> t.Tuple[argparse.Namespace, t.List[str]]:
+def run(argv: t.List[str]) -> t.Tuple[LoaderPipelineOptions, PipelineOptions]:
     """Main entrypoint & pipeline definition."""
-    parser = argparse.ArgumentParser(
-        prog='weather-mv',
-        description='Weather Mover loads weather data from cloud storage into analytics engines.'
+    # NOTE(bahmandar): this needs to be added for the flex template
+    if argv[1].startswith('--'):
+        argv.insert(1, 'bq')
+
+    parser = argparse.ArgumentParser()
+    _, pipeline_args = parser.parse_known_args(argv[1:])
+
+
+    # initializing Pipeline object
+    pipeline_options = PipelineOptions(
+      pipeline_args
     )
 
-    # Common arguments to all commands
-    base = argparse.ArgumentParser(add_help=False)
-    base.add_argument('-i', '--uris', type=str, required=True,
-                      help="URI glob pattern matching input weather data, e.g. 'gs://ecmwf/era5/era5-2015-*.gb'.")
-    base.add_argument('--topic', type=str,
-                      help="A Pub/Sub topic for GCS OBJECT_FINALIZE events, or equivalent, of a cloud bucket. "
-                           "E.g. 'projects/<PROJECT_ID>/topics/<TOPIC_ID>'.")
-    base.add_argument("--window_size", type=float, default=1.0,
-                      help="Output file's window size in minutes. Only used with the `topic` flag. Default: 1.0 "
-                           "minute.")
-    base.add_argument('--num_shards', type=int, default=5,
-                      help='Number of shards to use when writing windowed elements to cloud storage. Only used with '
-                           'the `topic` flag. Default: 5 shards.')
-    base.add_argument('-d', '--dry-run', action='store_true', default=False,
-                      help='Preview the load into BigQuery. Default: off')
+    # NOTE(bahmandar): This is required for flex templates. The flex template
+    # seems to have problems with arguments that cannot be explicitly set, i.e.
+    # boolean arguements. So the work around is to set our own arguement for public
+    # ips. Issue submitted https://github.com/apache/beam/issues/22727
+    known_args = pipeline_options.view_as(LoaderPipelineOptions)
+    pipeline_options.view_as(WorkerOptions).use_public_ips = known_args.public_ips
 
-    subparsers = parser.add_subparsers(help='help for subcommand', dest='subcommand')
+    # known_args = argparse.Namespace(**user_options)
 
-    # BigQuery command registration
-    bq_parser = subparsers.add_parser('bigquery', aliases=['bq'], parents=[base],
-                                      help='Move data into Google BigQuery')
-    ToBigQuery.add_parser_arguments(bq_parser)
-
-    # Regrid command registration
-    rg_parser = subparsers.add_parser('regrid', aliases=['rg'], parents=[base],
-                                      help='Copy and regrid grib data with MetView.')
-    Regrid.add_parser_arguments(rg_parser)
-
-    # EarthEngine command registration
-    ee_parser = subparsers.add_parser('earthengine', aliases=['ee'], parents=[base],
-                                      help='Move data into Google EarthEngine')
-    ToEarthEngine.add_parser_arguments(ee_parser)
-
-    known_args, pipeline_args = parser.parse_known_args(argv[1:])
 
     configure_logger(2)  # 0 = error, 1 = warn, 2 = info, 3 = debug
 
-    # Validate subcommand
-    if known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq':
-        ToBigQuery.validate_arguments(known_args, pipeline_args)
-    elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':
-        ToEarthEngine.validate_arguments(known_args, pipeline_args)
+
 
     # If a topic is used, then the pipeline must be a streaming pipeline.
     if known_args.topic:
-        pipeline_args.extend('--streaming true'.split())
+        pipeline_options.view_as(StandardOptions).streaming = True
+        # pipeline_args.extend('--streaming true'.split())
 
         # make sure we re-compute utcnow() every time rows are extracted from a file.
         known_args.import_time = None
@@ -196,4 +187,4 @@ def run(argv: t.List[str]) -> t.Tuple[argparse.Namespace, t.List[str]]:
     # NOTE(bahmandar): removed this because it was needed when the modules were seperated
     # pipeline_args.extend('--save_main_session true'.split())
 
-    return known_args, pipeline_args
+    return known_args, pipeline_options

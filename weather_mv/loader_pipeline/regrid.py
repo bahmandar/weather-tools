@@ -52,7 +52,7 @@ try:
     if threading.current_thread() is threading.main_thread():
         import metview as mv
     else:
-        logger.error('Metview not on main thread.')
+        logger.warning('Metview not on main thread.')
 except (ModuleNotFoundError, ImportError, FileNotFoundError):
     logger.error('Metview could not be imported.')
     mv = None  # noqa
