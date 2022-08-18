@@ -24,12 +24,6 @@
       "isOptional": true
     },
     {
-      "name": "area",
-      "helpText": "Target area in [N, W, S, E]. Default: Will include all available area.",
-      "label": "Target area in [N, W, S, E]",
-      "isOptional": true
-    },
-    {
       "name": "coordinate_chunk_size",
       "helpText": "this will dictate how fast beam will parallelize the splittable dofn",
       "label": "Intial splitting value",
@@ -49,7 +43,7 @@
     },
     {
       "name": "infer_schema",
-      "helpText": "Download one file in the URI pattern and infer a schema from that file. Default: off",
+      "helpText": "Download one file in the URI pattern and infer a schema from that file. Default: on",
       "label": "Infer Schema",
       "isOptional": true
     },
@@ -61,11 +55,5 @@
     }
   ]
 }
-
-
-
-
-
-
 
 

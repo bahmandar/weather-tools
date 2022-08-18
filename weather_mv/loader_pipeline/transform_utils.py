@@ -103,13 +103,11 @@ def map_dtype_to_sql_type(var_type: numpy.dtype, da_item: t.Any) -> str:
     """Maps a np.dtype to a suitable BigQuery column type."""
     #this doesnt cover the case that item 1 is none, nan or null
 
-
-
     if var_type in {np.dtype('float64'), np.dtype('float32'), np.dtype('timedelta64[ns]')}:
         return 'FLOAT64'
     elif var_type in {np.dtype('<M8[ns]')}:
         return 'TIMESTAMP'
-    elif var_type in {np.dtype('int8'), np.dtype('int16'), np.dtype('int32'), np.dtype('int64')}:
+    elif var_type in {np.dtype('int8'), np.dtype('int16'), np.dtype('int32'), np.dtype('int64'), np.dtype('uint8')}:
         return 'INT64'
     elif type(da_item) == str:
         return 'STRING'
@@ -133,6 +131,7 @@ def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery_beam.TableFieldSc
 
     columns = []
     for col in ds.variables.keys():
+
         if ds[col].size != 0:
             da_item = ds[col][tuple(0 for _ in range(len(ds[col].shape)))]
             columns.append((str(col), map_dtype_to_sql_type(ds[col].dtype, da_item)))
@@ -249,6 +248,8 @@ class PrepareFiles(beam.DoFn):
                                    self.enable_local_save,
                                    self.temp_gcs_location
                                    ) as ds:
+
+
             fields['num_of_elements'] = math.prod([v for k,v in ds.sizes.items()])
             t = Timer(name=f'TTT {HOSTNAME}: Preparing: {pathlib.Path(uri).name}:{fields["num_of_elements"]}',
                       text='{name}: {:.2f} seconds', logger=logger.info)
@@ -266,8 +267,11 @@ class PrepareFiles(beam.DoFn):
             else:
                 fields['schema'] = dataset_to_table_schema(ds)
 
+
             t.stop()
+
             yield FileOutput(**fields)
+
 
 
 class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
@@ -278,6 +282,7 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
     """
 
     def __init__(self):
+
         self.uris = []
         self.temp_gcs_location = None
         super().__init__()
@@ -336,6 +341,7 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
             current_position = tracker.current_restriction().start
             file_name = pathlib.Path(element.uri).name
             yield pvalue.TaggedOutput('uri', element.uri)
+
             while tracker.try_claim(current_position):
                 end = tracker.current_restriction().stop
 
@@ -386,8 +392,9 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
 
                     if 'latitude' in row and 'longitude' in row:
                         row[GEO_POINT_COLUMN] = fetch_geo_point(row['latitude'], row['longitude'])
+                    elif 'lat' in row and 'lon' in row:
+                        row[GEO_POINT_COLUMN] = fetch_geo_point(row['lat'], row['lon'])
                     yield pvalue.TaggedOutput('data', row)
-
                     # NOTE(bahmandar): without this statement dataflow would give
                     # warnings of process has gone for xxx seconds without a response
                     # this will also let dataflow know the progress for increasing workers

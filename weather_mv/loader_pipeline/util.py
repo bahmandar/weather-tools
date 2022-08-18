@@ -93,6 +93,7 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     """Returns the value with a type serializable to JSON"""
     # Note: The order of processing is significant.
     logger.debug('Serializing to JSON')
+
     if pd.isna(value) or value is None:
         return None
     elif np.issubdtype(type(value), np.floating):
@@ -317,7 +318,7 @@ def validate_region(output_table: t.Optional[str] = None,
     original_sigtstp_handler = signal.getsignal(signal.SIGTSTP)
     signal.signal(signal.SIGINT, do_bucket_cleanup)
     signal.signal(signal.SIGTSTP, do_bucket_cleanup)
-    print(output_table)
+
     if output_table:
         table_region = None
         bigquery_client = bigquery.Client()

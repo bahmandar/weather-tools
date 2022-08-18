@@ -160,9 +160,9 @@ class ToBigQuery(ToDataSink):
         subparser.add_argument('--import_time', type=str, default=datetime.datetime.utcnow().isoformat(),
                                help=("When writing data to BigQuery, record that data import occurred at this "
                                      "time (format: YYYY-MM-DD HH:MM:SS.usec+offset). Default: now in UTC."))
-        subparser.add_argument('--infer_schema', type=str2bool, nargs='?', const=True, default=False,
+        subparser.add_argument('--infer_schema', type=str2bool, nargs='?', const=True, default=True,
                                help='Download one file in the URI pattern and infer a schema from that file. Default: '
-                                    'off')
+                                    'on')
         subparser.add_argument('--xarray_open_dataset_kwargs', type=json.loads, default=None,
                                help='Keyword-args to pass into `xarray.open_dataset()` in the form of a JSON string.')
         subparser.add_argument('--disable_in_memory_copy', type=str2bool, nargs='?', const=True, default=False,
@@ -208,7 +208,7 @@ class ToBigQuery(ToDataSink):
     # NOTE(bahmandar): This will process all the schemas received from different
     # files
     def get_schema(self, sets):
-
+        logger.info('at get schema')
         table_schema = []
         schema_fields = []
         elements = sets[1]
@@ -237,9 +237,11 @@ class ToBigQuery(ToDataSink):
 
 
                 labels = {}
-                print(unique_attrs_dict)
+
                 for key, value in unique_attrs_dict.items():
-                    labels[clean_label_value(key)] = clean_label_value(value)
+                    # NOTE(bahmandar): 64 label limit for table. need to do subset
+                    if key.lower() in ['product_name', 'title', 'license', 'source', 'history', 'conventions']:
+                        labels[clean_label_value(key)] = clean_label_value(value)
 
                 labels['system'] = 'weather-mv'
                 user_email = get_user_email_from_credentials(credentials)
@@ -247,9 +249,11 @@ class ToBigQuery(ToDataSink):
                     labels['user'] = clean_label_value(user_email)
                 labels['server_account_email'] = clean_label_value(client.get_service_account_email())
 
+
+
                 table.labels = labels
                 table = client.update_table(table, ["labels"])  # API request
-                table.description = json.dumps(unique_attrs_dict, indent=1)
+                # table.description = json.dumps(unique_attrs_dict, indent=2)
                 table = client.update_table(table, ["description"])
             except Exception as e:
                 logger.error(f'Unable to create table in BigQuery: {e}')

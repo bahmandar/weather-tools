@@ -702,7 +702,11 @@ def open_dataset(uri,
 
                 if area:
                     n, w, s, e = area
-                    xr_dataset = xr_dataset.sel(latitude=slice(n, s), longitude=slice(w, e))
+                    # print([coord.name for coord in (x, y, t)])
+                    if 'longitude' in xr_dataset:
+                        xr_dataset = xr_dataset.sel(latitude=slice(n, s), longitude=slice(w, e))
+                    elif 'lon' in xr_dataset:
+                        xr_dataset = xr_dataset.sel(lat=slice(n, s), lon=slice(w, e))
                     logger.info(f'Data filtered by area, size: {convert_size(xr_dataset.nbytes)}')
 
                 # NOTE(bahmandar): This is NOT TESTED and this will have to load everything into
@@ -719,7 +723,7 @@ def open_dataset(uri,
                                 xr_dataset = _preprocess_tif(xr_dataset, None, tif_metadata_for_datetime, data_array)
 
                 current_size = xr_dataset.nbytes
-                if current_size < original_size * 0.25 and temp_gcs_location:
+                if current_size < original_size * 0.25 and temp_gcs_location and enable_local_save:
                     bucket_name, prefix = get_temp_gcs_info(uri, temp_gcs_location)
                     save_dataset(xr_dataset, bucket_name, prefix)
                     # uri_buffer = stack.enter_context(get_dataset(bucket_name, prefix))
