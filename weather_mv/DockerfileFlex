@@ -13,9 +13,10 @@ COPY loader_pipeline ${WORKDIR}/loader_pipeline
 RUN python ${WORKDIR}/setup.py -q sdist --dist-dir ${WORKDIR}/
 
 RUN find . -name "loader_pipeline*.tar.gz" -exec sh -c 'mv "$1" "loader_pipeline.tar.gz"' _ {} \;
+ENV FLEX_TEMPLATE_PYTHON_EXTRA_PACKAGES="${WORKDIR}/loader_pipeline.tar.gz"
 
-#ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE="${WORKDIR}/setup.py"
-ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE=""
+ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE="${WORKDIR}/setup.py"
+#ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE=""
 
 
 ENV FLEX_TEMPLATE_PYTHON_PY_FILE="${WORKDIR}/weather-mv"
@@ -23,7 +24,7 @@ ENV FLEX_TEMPLATE_PYTHON_PY_FILE="${WORKDIR}/weather-mv"
 # these are options after python like -m
 ENV FLEX_TEMPLATE_PYTHON_PY_OPTIONS=""
 
-ENV FLEX_TEMPLATE_PYTHON_EXTRA_PACKAGES="${WORKDIR}/loader_pipeline.tar.gz"
+
 ENV FLEX_TEMPLATE_PYTHON_REQUIREMENTS_FILE=""
 
 # Since we already downloaded all the dependencies, there's no need to rebuild everything.

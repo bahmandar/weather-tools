@@ -114,6 +114,7 @@ def pipeline(known_args: LoaderPipelineOptions,
             # paths = p | 'Create' >> beam.Create(known_args.uris)
             paths = (p
                      | 'Create' >> beam.Create(all_uris)
+                     | 'Recommended Fusion Break' >> beam.Reshuffle()
                      # | 'Match Files' >> fileio.MatchFiles(known_args.uris)
                      # | 'Read Matches' >> fileio.ReadMatches()
                      | 'Shuffle Paths' >> beam.Reshuffle()

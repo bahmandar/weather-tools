@@ -208,7 +208,6 @@ class ToBigQuery(ToDataSink):
     # NOTE(bahmandar): This will process all the schemas received from different
     # files
     def get_schema(self, sets):
-        logger.info('at get schema')
         table_schema = []
         schema_fields = []
         elements = sets[1]
