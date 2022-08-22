@@ -88,59 +88,66 @@ def pattern_to_uris(match_pattern: str) -> t.Iterable[str]:
 def pipeline(known_args: LoaderPipelineOptions,
              pipeline_options: PipelineOptions) -> None:
     all_uris = list(pattern_to_uris(known_args.uris))
-    if not all_uris:
-        raise FileNotFoundError(
-            f'File prefix "{known_args.uris}" matched no objects')
+    # if not all_uris:
+    #     raise FileNotFoundError(
+    #         f'File prefix "{known_args.uris}" matched no objects')
     known_args_dict = known_args.get_all_options()
 
     with beam.Pipeline(options=pipeline_options) as p:
-        # Validate subcommand
-        if known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq':
-            ToBigQuery.validate_arguments(known_args, pipeline_options)
-        elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':
-            ToEarthEngine.validate_arguments(known_args, pipeline_options)
-        if known_args.topic:
-            paths = (
-                p
-                # Windowing is based on this code sample:
-                # https://cloud.google.com/pubsub/docs/pubsub-dataflow#code_sample
-                | 'ReadUploadEvent' >> beam.io.ReadFromPubSub(known_args.topic)
-                | 'WindowInto' >> GroupMessagesByFixedWindows(known_args.window_size, known_args.num_shards)
-                | 'ParsePaths' >> beam.ParDo(ParsePaths(known_args.uris))
-            )
+        if not all_uris:
+            (p
+             | 'No Objects Message Create' >> beam.Create([f'File prefix "{known_args.uris}" matched no objects'])
+             | 'No Objects Message Output' >> beam.Map(logger.info)
+             )
         else:
-            # NOTE(bahmandar): utilizing the pipeline to matchfiles and read matches ended
-            # up being slow cause it was continually check sizes or something
-            # paths = p | 'Create' >> beam.Create(known_args.uris)
-            paths = (p
-                     | 'Create' >> beam.Create(all_uris)
-                     | 'Recommended Fusion Break' >> beam.Reshuffle()
-                     # | 'Match Files' >> fileio.MatchFiles(known_args.uris)
-                     # | 'Read Matches' >> fileio.ReadMatches()
-                     | 'Shuffle Paths' >> beam.Reshuffle()
-                     )
 
-            # NOTE(bahmandar): will use temp_gcs_location to store a temp zarr when the 
-            # data is filtered
-            p_options = pipeline_options.get_all_options()
-            if temp_gcs_location := p_options.get('temp_location'):
-                job_name = p_options.get('job_name', 'beam')
-                temp_gcs_location = os.path.join(temp_gcs_location,
-                                                 f'{job_name}.{time.time()}')
-            logger.info(f'KNOWN ARGS: {known_args}')
-            logger.info(f'subcommand: {known_args.subcommand}')
-            if (known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq'):
-                (paths
-                 | "MoveToBigQuery" >> ToBigQuery.from_kwargs(
-                        temp_gcs_location=temp_gcs_location,
-                        **known_args_dict)
-                 )
-            elif known_args.subcommand == 'regrid' or known_args.subcommand == 'rg':
-                paths | "Regrid" >> Regrid.from_kwargs(**known_args_dict)
+            # Validate subcommand
+            if known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq':
+                ToBigQuery.validate_arguments(known_args, pipeline_options)
             elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':
-                paths | "MoveToEarthEngine" >> ToEarthEngine.from_kwargs(**known_args_dict)
+                ToEarthEngine.validate_arguments(known_args, pipeline_options)
+            if known_args.topic:
+                paths = (
+                    p
+                    # Windowing is based on this code sample:
+                    # https://cloud.google.com/pubsub/docs/pubsub-dataflow#code_sample
+                    | 'ReadUploadEvent' >> beam.io.ReadFromPubSub(known_args.topic)
+                    | 'WindowInto' >> GroupMessagesByFixedWindows(known_args.window_size, known_args.num_shards)
+                    | 'ParsePaths' >> beam.ParDo(ParsePaths(known_args.uris))
+                )
             else:
-                raise ValueError('invalid subcommand!')
+                # NOTE(bahmandar): utilizing the pipeline to matchfiles and read matches ended
+                # up being slow cause it was continually check sizes or something
+                # paths = p | 'Create' >> beam.Create(known_args.uris)
+                paths = (p
+                         | 'Create' >> beam.Create(all_uris)
+                         | 'Recommended Fusion Break' >> beam.Reshuffle()
+                         # | 'Match Files' >> fileio.MatchFiles(known_args.uris)
+                         # | 'Read Matches' >> fileio.ReadMatches()
+                         | 'Shuffle Paths' >> beam.Reshuffle()
+                         )
+
+                # NOTE(bahmandar): will use temp_gcs_location to store a temp zarr when the
+                # data is filtered
+                p_options = pipeline_options.get_all_options()
+                if temp_gcs_location := p_options.get('temp_location'):
+                    job_name = p_options.get('job_name', 'beam')
+                    temp_gcs_location = os.path.join(temp_gcs_location,
+                                                     f'{job_name}.{time.time()}')
+                logger.info(f'KNOWN ARGS: {known_args}')
+                logger.info(f'subcommand: {known_args.subcommand}')
+                if (known_args.subcommand == 'bigquery' or known_args.subcommand == 'bq'):
+                    (paths
+                     | "MoveToBigQuery" >> ToBigQuery.from_kwargs(
+                            temp_gcs_location=temp_gcs_location,
+                            **known_args_dict)
+                     )
+                elif known_args.subcommand == 'regrid' or known_args.subcommand == 'rg':
+                    paths | "Regrid" >> Regrid.from_kwargs(**known_args_dict)
+                elif known_args.subcommand == 'earthengine' or known_args.subcommand == 'ee':
+                    paths | "MoveToEarthEngine" >> ToEarthEngine.from_kwargs(**known_args_dict)
+                else:
+                    raise ValueError('invalid subcommand!')
 
     logger.info('Pipeline is finished.')
 

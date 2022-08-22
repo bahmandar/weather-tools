@@ -52,6 +52,12 @@
       "helpText": "Set true to enable public ip usage. Default: off",
       "label": "Public ips",
       "isOptional": true
+    },
+    {
+      "name": "disk_size_gb",
+      "helpText": "int gb for the disk space",
+      "label": "Disk Size GB",
+      "isOptional": true
     }
   ]
 }

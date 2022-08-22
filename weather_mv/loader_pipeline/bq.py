@@ -177,7 +177,7 @@ class ToBigQuery(ToDataSink):
                                     'BigQuery. Used to tune parallel uploads.')
         subparser.add_argument('--disable_grib_schema_normalization', type=str2bool, nargs='?', const=True, default=False,
                                help="To disable grib's schema normalization. Default: off")
-        subparser.add_argument('--enable_local_save', type=str2bool, nargs='?', const=True, default=False,
+        subparser.add_argument('--enable_local_save', type=str2bool, nargs='?', const=True, default=None,
                                help="To enable saving files to each vm Default: off")
         subparser.add_argument('--public_ips', type=str2bool, nargs='?', const=True, default=False,
                                help="To enable the use of public ips Default: off")
@@ -228,7 +228,7 @@ class ToBigQuery(ToDataSink):
             # Create the table in BigQuery
             try:
                 client = bigquery.Client()
-                table = bigquery.Table(self.output_table.replace(":","."), schema=table_schema)
+                table = bigquery.Table(self.output_table.replace(":", "."), schema=table_schema)
                 credentials = GoogleCredentials.get_application_default()
                 table = client.create_table(table, exists_ok=True)
                 unique_attrs = [k for j, k in enumerate(attrs_list) if k not in attrs_list[j + 1:]]
