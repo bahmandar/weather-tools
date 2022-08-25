@@ -25,6 +25,7 @@ from apache_beam.io.filesystems import FileSystems
 from apache_beam.pipeline import PipelineOptions
 from apache_beam.options.pipeline_options import WorkerOptions
 from apache_beam.options.pipeline_options import StandardOptions
+from apache_beam.options.pipeline_options import DebugOptions
 from .bq import ToBigQuery
 from .ee import ToEarthEngine
 from .regrid import Regrid
@@ -164,7 +165,7 @@ def run(argv: t.List[str]) -> t.Tuple[LoaderPipelineOptions, PipelineOptions]:
 
     # initializing Pipeline object
     pipeline_options = PipelineOptions(
-      pipeline_args
+      pipeline_args,
     )
 
     # NOTE(bahmandar): This is required for flex templates. The flex template
@@ -173,6 +174,17 @@ def run(argv: t.List[str]) -> t.Tuple[LoaderPipelineOptions, PipelineOptions]:
     # ips. Issue submitted https://github.com/apache/beam/issues/22727
     known_args = pipeline_options.view_as(LoaderPipelineOptions)
     pipeline_options.view_as(WorkerOptions).use_public_ips = known_args.public_ips
+
+    # NOTE(bahmandar) if not already set adding use_runner_v2
+    if not pipeline_options.view_as(DebugOptions).experiments:
+        pipeline_options.view_as(DebugOptions).experiments = ['use_runner_v2']
+
+    # NOTE(bahmandar) Adding this to enable horizontal scaling
+    if not pipeline_options.view_as(WorkerOptions).autoscaling_algorithm:
+        pipeline_options.view_as(WorkerOptions).autoscaling_algorithm = 'THROUGHPUT_BASED'
+
+
+    # pipeline_options.view_as(DebugOptions).experiments = known_args.public_ips
 
     # known_args = argparse.Namespace(**user_options)
 

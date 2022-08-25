@@ -60,7 +60,8 @@ from .transform_utils import (
     FanOut,
     WindowPerFile,
     ProcessFiles,
-    PrepareFiles
+    PrepareFiles,
+    DATA_URI_COLUMN
 )
 
 logger = logging.getLogger(__name__)
@@ -236,11 +237,12 @@ class ToBigQuery(ToDataSink):
 
 
                 labels = {}
-
+                unique_attrs_dict_serializable = {}
                 for key, value in unique_attrs_dict.items():
                     # NOTE(bahmandar): 64 label limit for table. need to do subset
                     if key.lower() in ['product_name', 'title', 'license', 'source', 'history', 'conventions']:
                         labels[clean_label_value(key)] = clean_label_value(value)
+                    unique_attrs_dict_serializable[key] = to_json_serializable_type(value)
 
                 labels['system'] = 'weather-mv'
                 user_email = get_user_email_from_credentials(credentials)
@@ -252,7 +254,7 @@ class ToBigQuery(ToDataSink):
 
                 table.labels = labels
                 table = client.update_table(table, ["labels"])  # API request
-                # table.description = json.dumps(unique_attrs_dict, indent=2)
+                table.description = json.dumps(unique_attrs_dict_serializable, indent=2)
                 table = client.update_table(table, ["description"])
             except Exception as e:
                 logger.error(f'Unable to create table in BigQuery: {e}')
@@ -360,20 +362,22 @@ class ToBigQuery(ToDataSink):
         )
 
         extracted_rows = (
-            prepared_files | 'Process Files' >> beam.ParDo(ProcessFiles()).with_outputs()
+            prepared_files | 'Process Files' >> beam.ParDo(ProcessFiles())
         )
+
 
         # NOTE(bahmandar): This was not done in teardown because other dofns
         # could still be using the gcs temp files
         (
-          extracted_rows.uri
+          extracted_rows
+          | 'Extract Uris' >> beam.Map(lambda x: x.get(DATA_URI_COLUMN))
           | 'Dedupe Uris' >> beam.Distinct()
           | 'Clean Remote Temp Files' >> beam.Map(lambda x: delete_remote_temp_file(x, self.temp_gcs_location))
         )
 
         if not self.dry_run:
             (
-                    extracted_rows.data
+                    extracted_rows
                     | 'WriteToBigQuery' >> WriteToBigQuery(
                         project=self.project,
                         table=self.output_table,

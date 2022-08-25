@@ -7,6 +7,8 @@ set -eu
 
 PROJECT_ID=$(gcloud config list --format 'value(core.project)')
 
+gcloud config set project "${PROJECT_ID}"
+
 gcloud builds submit . --config=cloudbuildFlex.yaml \
 --project="${PROJECT_ID}"
 

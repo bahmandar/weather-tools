@@ -337,12 +337,18 @@ def uri_to_hash_file(uri: str, extension=None) -> str:
     local_filename = pathlib.Path(sha256(uri.encode()).hexdigest()[:22]).with_suffix(extension)
     return str(local_filename)
 
+class gcloudException(Exception):
+    pass
 
 def log_subprocess_output(pipe):
     for line in iter(pipe.readline, ''): # b'\n'-separated lines
         line_output = line.strip()
         if line_output:
             logger.info(f'TTT {HOSTNAME}: subprocess: {line_output}')
+            # NOTE(bahmandar): A hash mismatch didn't put out an exit code != 0
+            # this is the reason for this check
+            if "ERROR" in line_output:
+                raise gcloudException(line_output)
 
 
 def delete_local_file(uri):
@@ -402,6 +408,32 @@ def get_uri_size(uri):
         return get_buffer_size(remote_file)
 
 
+def copy_with_shutil(uri, dest_file):
+    with apache_beam.io.gcsio.GcsIO().open(filename=uri,
+                                           read_buffer_size=CUSTOM_READ_BUFFER_SIZE,
+                                           mode="rb", mime_type='application/octet-stream') as source_file:
+        shutil.copyfileobj(source_file, dest_file, CUSTOM_READ_BUFFER_SIZE)
+
+
+
+@tenacity.retry(
+  wait=tenacity.wait_random_exponential(multiplier=0.5, max=60),
+  stop=(tenacity.stop_after_attempt(2)),
+  before_sleep=tenacity.before_sleep_log(logger, logging.INFO),
+  after=tenacity.after_log(logger, logging.INFO),
+  retry_error_callback=lambda retry_state: 1)
+def copy_with_gcloud(uri, dest_file):
+    try:
+        process = Popen(['gcloud', 'alpha', 'storage', 'cp', uri, dest_file.name], stdout=PIPE, stderr=STDOUT, universal_newlines=True)
+        with process.stdout:
+            log_subprocess_output(process.stdout)
+        exitcode = process.wait() # 0 means success
+        return exitcode
+    except OSError as e:
+        logger.warning(e)
+        # yield None
+        return 1
+
 @contextlib.contextmanager
 def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[t.Union[str, None]]:
     t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
@@ -421,22 +453,16 @@ def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[
                     # one issue is that gcloud ran out of space while downloading the file
                     dest_file.truncate(source_file_size)
                     try:
-                        process = Popen(['gcloud', 'alpha', 'storage', 'cp', uri, dest_file.name], stdout=PIPE, stderr=STDOUT, universal_newlines=True)
-                        with process.stdout:
-                            log_subprocess_output(process.stdout)
-                        exitcode = process.wait() # 0 means success
-                        if exitcode != 0:
+                        exit_code = copy_with_gcloud(uri, dest_file)
+                        if exit_code != 0:
                             # with FileSystems().open(uri) as source_file:
-                            with apache_beam.io.gcsio.GcsIO().open(filename=uri,
-                                                                   read_buffer_size=CUSTOM_READ_BUFFER_SIZE,
-                                                                   mode="rb", mime_type='application/octet-stream') as source_file:
-                                shutil.copyfileobj(source_file, dest_file, CUSTOM_READ_BUFFER_SIZE)
+                            copy_with_shutil(uri, dest_file)
                         dest_file.flush()
                         dest_file.seek(0)
+
                         t.name = f'TTT {HOSTNAME}: Created Local GCS File: {dest_file.name}'
                         t.stop()
-                    except OSError as e:
-                        logger.warning(e)
+                    except Exception:
                         yield None
                     try:
                         modification_time = time.time()
@@ -475,7 +501,7 @@ def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[
         yield None
 
 
-# TODO(ALI) update this if mod thing works
+# TODO(bahmandar) update this if modification time thing works
 # NOTE(bahmandar): Focus was on GCS usage but cleaning this up if need is a good
 # next step
 @contextlib.contextmanager

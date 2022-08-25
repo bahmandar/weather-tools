@@ -228,11 +228,11 @@ class PrepareFiles(beam.DoFn):
     #
     # # NOTE(bahmandar): This will run if job is "stopped"
     def teardown(self):
-        delete_local_temp_files(self.uris)
+        #delete_local_temp_files(self.uris)
         super().teardown()
     #
     def finish_bundle(self):
-        delete_local_temp_files(self.uris)
+        #delete_local_temp_files(self.uris)
         super().finish_bundle()
 
     def process(self, uri: str) -> tp.Iterable[FileOutput]:
@@ -340,7 +340,7 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
 
             current_position = tracker.current_restriction().start
             file_name = pathlib.Path(element.uri).name
-            yield pvalue.TaggedOutput('uri', element.uri)
+            # yield pvalue.TaggedOutput('uri', element.uri)
 
             while tracker.try_claim(current_position):
                 end = tracker.current_restriction().stop
@@ -394,7 +394,8 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
                         row[GEO_POINT_COLUMN] = fetch_geo_point(row['latitude'], row['longitude'])
                     elif 'lat' in row and 'lon' in row:
                         row[GEO_POINT_COLUMN] = fetch_geo_point(row['lat'], row['lon'])
-                    yield pvalue.TaggedOutput('data', row)
+                    # yield pvalue.TaggedOutput('data', row)
+                    yield row
                     # NOTE(bahmandar): without this statement dataflow would give
                     # warnings of process has gone for xxx seconds without a response
                     # this will also let dataflow know the progress for increasing workers
