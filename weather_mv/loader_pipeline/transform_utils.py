@@ -89,9 +89,9 @@ class FileOutput(t.NamedTuple):
     disable_in_memory_copy: bool
     tif_metadata_for_datetime: t.Optional[str]
     disable_grib_schema_normalization: bool
-    coordinate_chunk_size: int
     dry_run: bool
     schema: t.List[bigquery_beam.TableFieldSchema]
+    coordinate_chunk_size: int = None
     table: bigquery.Table = None
     variables: t.List[str] = None
     import_time: t.Optional[datetime.datetime] = DEFAULT_IMPORT_TIME
@@ -115,6 +115,10 @@ def map_dtype_to_sql_type(var_type: numpy.dtype, da_item: t.Any) -> str:
     elif var_type in {np.dtype(object)}:
         if hasattr(da_item, 'isoformat'):
             return 'DATETIME'
+    # NOTE(bahmandar): S1 data types issue
+    elif np.issubdtype(var_type, np.bytes_):
+        return 'STRING'
+
     raise ValueError(f"Unknown mapping from '{var_type}' to SQL type")
 
 
@@ -131,7 +135,6 @@ def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery_beam.TableFieldSc
 
     columns = []
     for col in ds.variables.keys():
-
         if ds[col].size != 0:
             da_item = ds[col][tuple(0 for _ in range(len(ds[col].shape)))]
             columns.append((str(col), map_dtype_to_sql_type(ds[col].dtype, da_item)))
@@ -207,7 +210,7 @@ class PrepareFiles(beam.DoFn):
     tif_metadata_for_datetime: t.Optional[str] = None
     disable_grib_schema_normalization: bool = None
     infer_schema: bool = None
-    coordinate_chunk_size: int = 1_000_000
+    coordinate_chunk_size: int = None
     dry_run: bool = False
     enable_local_save: bool = None
     uris: t.List[str] = None
@@ -248,6 +251,18 @@ class PrepareFiles(beam.DoFn):
                                    self.enable_local_save,
                                    self.temp_gcs_location
                                    ) as ds:
+
+            # NOTE(bahmandar): There was a case where this didn't work well. many coordinates and some note used
+            # max_num_of_elements = 0
+            # for variable in ds.variables:
+            #     num_of_elements = math.prod(ds[variable].shape)
+            #     if num_of_elements > max_num_of_elements:
+            #         max_num_of_elements = num_of_elements
+            # fields['num_of_elements'] = max_num_of_elements
+
+
+
+
 
 
             fields['num_of_elements'] = math.prod([v for k,v in ds.sizes.items()])
@@ -313,7 +328,10 @@ class ProcessFiles(beam.DoFn, beam.transforms.core.RestrictionProvider):
     # NOTE(bahmandar): This dictates the immediate splitting. smaller number
     def split(self, element: FileOutput, restriction):
         i = restriction.start
-        split_size = element.coordinate_chunk_size
+        if element.coordinate_chunk_size:
+            split_size = element.coordinate_chunk_size
+        else:
+            split_size = int(element.num_of_elements/1000)
         while i < restriction.stop - split_size:
             yield OffsetRange(i, i + split_size)
             i += split_size

@@ -53,7 +53,8 @@ from .util import (
     get_iterator_minimal,
     clean_label_value,
     get_user_email_from_credentials,
-    str2bool
+    str2bool,
+    parse_area_list
 
 )
 from .transform_utils import (
@@ -105,7 +106,7 @@ class ToBigQuery(ToDataSink):
         output_table: The destination for where data should be written in BigQuery
         variables: Target variables (or coordinates) for the BigQuery schema. By default,
           all data variables will be imported as columns.
-        area: Target area in [N, W, S, E]; by default, all available area is included.
+        area: Target area in "[N, W, S, E]"; by default, all available area is included.
         import_time: The time when data was imported. This is used as a simple way to
           version data — variables can be distinguished based on import time. If None,
           the system will recompute the current time upon row extraction for each file.
@@ -142,7 +143,7 @@ class ToBigQuery(ToDataSink):
     tif_metadata_for_datetime: t.Optional[str]
     skip_region_validation: bool
     disable_grib_schema_normalization: bool
-    coordinate_chunk_size: int = 1_000_000
+    coordinate_chunk_size: int = None
     table_schema: bigquery_beam.TableSchema = None
     project: str = None
     enable_local_save: bool = None
@@ -156,8 +157,9 @@ class ToBigQuery(ToDataSink):
         subparser.add_argument('-v', '--variables', metavar='variables', type=str, nargs='+', default=None,
                                help='Target variables (or coordinates) for the BigQuery schema. Default: will import '
                                     'all data variables as columns.')
-        subparser.add_argument('-a', '--area', metavar='area', type=int, nargs='+', default=None,
-                               help='Target area in [N, W, S, E]. Default: Will include all available area.')
+        subparser.add_argument('-a', '--area', metavar='area', type=parse_area_list, default=None,
+                               help='Target area in "[N, W, S, E]" or "[latitude_max, longitude_min, latitude_min, longitude_max]"'
+                                    'Default: Will include all available area')
         subparser.add_argument('--import_time', type=str, default=datetime.datetime.utcnow().isoformat(),
                                help=("When writing data to BigQuery, record that data import occurred at this "
                                      "time (format: YYYY-MM-DD HH:MM:SS.usec+offset). Default: now in UTC."))
@@ -173,7 +175,7 @@ class ToBigQuery(ToDataSink):
                                     'Applicable only for tif files.')
         subparser.add_argument('-s', '--skip_region_validation', type=str2bool, nargs='?', const=True, default=False,
                                help='Skip validation of regions for data migration. Default: off')
-        subparser.add_argument('--coordinate_chunk_size', type=int, default=100_000,
+        subparser.add_argument('--coordinate_chunk_size', type=int, default=None,
                                help='The size of the chunk of coordinates used for extracting vector data into '
                                     'BigQuery. Used to tune parallel uploads.')
         subparser.add_argument('--disable_grib_schema_normalization', type=str2bool, nargs='?', const=True, default=False,
@@ -312,7 +314,7 @@ class ToBigQuery(ToDataSink):
             # with what is in the ToBigQuery class
             | 'Prepare Files' >> beam.ParDo(PrepareFiles(*(dataclasses.asdict(self).get(k.name) for k in dataclasses.fields(PrepareFiles))))
             # NOTE(bahmandar): shuffled in case of fusion. Might not be needed
-            | 'Shuffle' >> beam.Reshuffle()
+            # | 'Shuffle' >> beam.Reshuffle()
             
             # NOTE(bahmandar): the three transforms below are not utilized anymore
             # this was used if each variable in the file was processed by itself

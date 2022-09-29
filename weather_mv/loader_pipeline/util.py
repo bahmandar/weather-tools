@@ -94,13 +94,30 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     # Note: The order of processing is significant.
     logger.debug('Serializing to JSON')
 
-    if pd.isna(value) or value is None:
+
+    # NOTE(bahmandar) first convert out of list before processing the rest
+    if type(value) == np.ndarray:
+        value = value.tolist()
+
+    if type(value) == list:
+        value = ','.join(map(str, value))
+
+
+    if pd.isna(value):
         return None
-    elif np.issubdtype(type(value), np.floating):
+    if np.issubdtype(type(value), np.floating):
         return float(value)
-    elif type(value) == np.ndarray:
-        # Will return a scaler if array is of size 1, else will return a list.
-        return value.tolist()
+    elif type(value) == bytes:
+        return value.decode('utf-8', errors='ignore').replace('\x00','').strip()
+    # elif type(value) == np.ndarray:
+    #     # Will return a scaler if array is of size 1, else will return a list.
+    #     value_to_return = value.tolist()
+    #     print(type(value_to_return))
+    #     if type(value_to_return) == bytes:
+    #         return value_to_return.decode('utf-8', errors='ignore').replace('\x00','').strip()
+    #
+    #     else:
+    #         return value_to_return
     # NOTE(bahmandar): this for rasm.nc cftime._cftime.DatetimeNoLeap
     elif type(value) == datetime.datetime or type(value) == str or type(value) == np.datetime64 or hasattr(value, 'isoformat'):
         # Assume strings are ISO format timestamps...
@@ -299,6 +316,17 @@ def str2bool(v):
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
 
+
+def parse_area_list(v):
+    """Parse string list and output integer list.
+
+    Args:
+      string: string argument (i.e. "[N,W,S,E]"), "[-50, -80, -40, -70]")
+
+    Returns:
+      :param value:    tuple list area
+    """
+    return eval(v)
 
 def validate_region(output_table: t.Optional[str] = None,
                     temp_location: t.Optional[str] = None,

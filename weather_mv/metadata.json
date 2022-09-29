@@ -58,6 +58,12 @@
       "helpText": "int gb for the disk space",
       "label": "Disk Size GB",
       "isOptional": true
+    },
+    {
+      "name": "area",
+      "helpText": "area to filter in the format '[N, W, S, E]' '[latitude_max, longitude_min, latitude_min, longitude_max]' as a string",
+      "label": "Area",
+      "isOptional": true
     }
   ]
 }

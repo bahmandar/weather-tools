@@ -13,80 +13,93 @@ ENV CLOUDSDK_PYTHON_SITEPACKAGES=1
 RUN apt-get update -y \
     && apt-get install libffi-dev git g++ gfortran make cmake automake \
     pkg-config flex bison libeccodes-dev libeccodes-tools metview=5.10.2-1 \
-    metview-data=5.10.2-1 libmetview0d=5.10.2-1 libmetview-dev=5.10.2-1 -y \
-    && apt-get clean
+    metview-data=5.10.2-1 libmetview0d=5.10.2-1 libmetview-dev=5.10.2-1 sqlite3 \
+    libgeos-dev libproj-dev libopenjp2-7 hdf5-tools libnetcdf-dev -y \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Fixes the metview issue with debian
 RUN mkdir -p /usr/share/metview/share
 RUN ln -s /usr/share/metview/*  /usr/share/metview/share/
 RUN ln -s /usr/lib/ /usr/share/metview/
 
-ENV CURL_VERSION 7.83.1
-RUN wget -q https://curl.haxx.se/download/curl-${CURL_VERSION}.tar.gz \
-    && tar -xzf curl-${CURL_VERSION}.tar.gz && cd curl-${CURL_VERSION} \
-    && ./configure --prefix=/usr/local \
-    --with-openssl \
-    && echo "building CURL ${CURL_VERSION}..." \
-    && make --quiet -j$(nproc) && make --quiet install \
-    && cd $WORKDIR && rm -rf curl-${CURL_VERSION}.tar.gz curl-${CURL_VERSION}
+# NOTE(bahmandar): curl 7.74.0 is already installed on base image
+#ENV CURL_VERSION 7.83.1
+#RUN wget -q https://curl.haxx.se/download/curl-${CURL_VERSION}.tar.gz \
+#    && tar -xzf curl-${CURL_VERSION}.tar.gz && cd curl-${CURL_VERSION} \
+#    && ./configure --prefix=/usr/local \
+#    --with-openssl \
+#    && echo "building CURL ${CURL_VERSION}..." \
+#    && make --quiet -j$(nproc) && make --quiet install \
+#    && cd $WORKDIR && rm -rf curl-${CURL_VERSION}.tar.gz curl-${CURL_VERSION}
 
-ENV GEOS_VERSION 3.10.3
-RUN wget -q https://download.osgeo.org/geos/geos-${GEOS_VERSION}.tar.bz2 \
-    && tar -xjf geos-${GEOS_VERSION}.tar.bz2  \
-    && cd geos-${GEOS_VERSION} \
-    && ./configure --prefix=/usr/local \
-    && echo "building geos ${GEOS_VERSION}..." \
-    && make --quiet -j$(nproc) && make --quiet install \
-    && cd $WORKDIR && rm -rf geos-${GEOS_VERSION}.tar.bz2 geos-${GEOS_VERSION}
+# NOTE(bahmandar): geos 3.9.0 can be gotten via apt-get install libgeos-dev
+#ENV GEOS_VERSION 3.10.3
+#RUN wget -q https://download.osgeo.org/geos/geos-${GEOS_VERSION}.tar.bz2 \
+#    && tar -xjf geos-${GEOS_VERSION}.tar.bz2  \
+#    && cd geos-${GEOS_VERSION} \
+#    && ./configure --prefix=/usr/local \
+#    && echo "building geos ${GEOS_VERSION}..." \
+#    && make --quiet -j$(nproc) && make --quiet install \
+#    && cd $WORKDIR && rm -rf geos-${GEOS_VERSION}.tar.bz2 geos-${GEOS_VERSION}
 
-ENV SQLITE_VERSION 3380500
-ENV SQLITE_YEAR 2022
-RUN wget -q https://sqlite.org/${SQLITE_YEAR}/sqlite-autoconf-${SQLITE_VERSION}.tar.gz \
-    && tar -xzf sqlite-autoconf-${SQLITE_VERSION}.tar.gz && cd sqlite-autoconf-${SQLITE_VERSION} \
-    && ./configure --prefix=/usr/local \
-    && echo "building SQLITE ${SQLITE_VERSION}..." \
-    && make --quiet -j$(nproc) && make --quiet install \
-    && cd $WORKDIR && rm -rf sqlite-autoconf-${SQLITE_VERSION}.tar.gz sqlite-autoconf-${SQLITE_VERSION}
 
-ENV PROJ_VERSION 9.0.0
-RUN wget -q https://download.osgeo.org/proj/proj-${PROJ_VERSION}.tar.gz \
-    && tar -xzf proj-${PROJ_VERSION}.tar.gz \
-    && cd proj-${PROJ_VERSION} \
-    && mkdir build && cd build \
-    && PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DENABLE_CURL=OFF -DBUILD_PROJSYNC=OFF \
-    && echo "building proj ${PROJ_VERSION}..." \
-    && cmake --build . && cmake --build . --target install \
-    && cd $WORKDIR && rm -rf proj-${PROJ_VERSION}.tar.gz proj-${PROJ_VERSION}
+# NOTE(bahmandar): sqlite3 3.34.1-3 2021-01-20 can be gotten via apt-get install sqlite3
+#ENV SQLITE_VERSION 3380500
+#ENV SQLITE_YEAR 2022
+#RUN wget -q https://sqlite.org/${SQLITE_YEAR}/sqlite-autoconf-${SQLITE_VERSION}.tar.gz \
+#    && tar -xzf sqlite-autoconf-${SQLITE_VERSION}.tar.gz && cd sqlite-autoconf-${SQLITE_VERSION} \
+#    && ./configure --prefix=/usr/local \
+#    && echo "building SQLITE ${SQLITE_VERSION}..." \
+#    && make --quiet -j$(nproc) && make --quiet install \
+#    && cd $WORKDIR && rm -rf sqlite-autoconf-${SQLITE_VERSION}.tar.gz sqlite-autoconf-${SQLITE_VERSION}
 
-ENV OPENJPEG_VERSION 2.5.0
-RUN wget -q -O openjpeg-${OPENJPEG_VERSION}.tar.gz https://github.com/uclouvain/openjpeg/archive/v${OPENJPEG_VERSION}.tar.gz \
-    && tar -zxf openjpeg-${OPENJPEG_VERSION}.tar.gz \
-    && cd openjpeg-${OPENJPEG_VERSION} \
-    && mkdir build && cd build \
-    && cmake .. -DBUILD_THIRDPARTY:BOOL=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
-    && echo "building openjpeg ${OPENJPEG_VERSION}..." \
-    && make --quiet -j$(nproc) && make --quiet install \
-    && cd $WORKDIR && rm -rf openjpeg-${OPENJPEG_VERSION}.tar.gz openjpeg-${OPENJPEG_VERSION}
+# NOTE(bahmandar): proj 7.2.1-1 via apt-get install proj-bin
+#ENV PROJ_VERSION 9.0.0
+#RUN wget -q https://download.osgeo.org/proj/proj-${PROJ_VERSION}.tar.gz \
+#    && tar -xzf proj-${PROJ_VERSION}.tar.gz \
+#    && cd proj-${PROJ_VERSION} \
+#    && mkdir build && cd build \
+#    && PKG_CONFIG_PATH=/usr/local/lib/pkgconfig cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local -DENABLE_CURL=OFF -DBUILD_PROJSYNC=OFF \
+#    && echo "building proj ${PROJ_VERSION}..." \
+#    && cmake --build . && cmake --build . --target install \
+#    && cd $WORKDIR && rm -rf proj-${PROJ_VERSION}.tar.gz proj-${PROJ_VERSION}
 
-ENV HDF5_VERSION 1.10.5
-RUN wget -q https://support.hdfgroup.org/ftp/HDF5/current/src/hdf5-${HDF5_VERSION}.tar.gz \
-    && tar -xzf hdf5-${HDF5_VERSION}.tar.gz \
-    && cd hdf5-${HDF5_VERSION} \
-    && mkdir install \
-    && ./configure --prefix=/usr/local \
-#    && make check \
-    && make install \
-    && cd $WORKDIR && rm -rf hdf5-${HDF5_VERSION}.tar.gz hdf5-${HDF5_VERSION}
 
-ENV NETCDF_VERSION 4.9.0
-RUN wget -q https://downloads.unidata.ucar.edu/netcdf-c/${NETCDF_VERSION}/netcdf-c-${NETCDF_VERSION}.tar.gz \
-    && tar -xzf netcdf-c-${NETCDF_VERSION}.tar.gz \
-    && cd netcdf-c-${NETCDF_VERSION} \
-    && mkdir install \
-    && ./configure --prefix=/usr/local -disable-dap \
-#    && make check \
-    && make install \
-    && cd $WORKDIR && rm -rf netcdf-c-${NETCDF_VERSION}.tar.gz netcdf-c-${NETCDF_VERSION}
+
+# NOTE(bahmandar): openjpeg 2.4.0-3 via apt-get install libopenjp2-7 libopenjp2-tool
+#ENV OPENJPEG_VERSION 2.5.0
+#RUN wget -q -O openjpeg-${OPENJPEG_VERSION}.tar.gz https://github.com/uclouvain/openjpeg/archive/v${OPENJPEG_VERSION}.tar.gz \
+#    && tar -zxf openjpeg-${OPENJPEG_VERSION}.tar.gz \
+#    && cd openjpeg-${OPENJPEG_VERSION} \
+#    && mkdir build && cd build \
+#    && cmake .. -DBUILD_THIRDPARTY:BOOL=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local \
+#    && echo "building openjpeg ${OPENJPEG_VERSION}..." \
+#    && make --quiet -j$(nproc) && make --quiet install \
+#    && cd $WORKDIR && rm -rf openjpeg-${OPENJPEG_VERSION}.tar.gz openjpeg-${OPENJPEG_VERSION}
+
+# NOTE(bahmandar): hdf5  1.10.6 via apt install hdf5-tools
+
+#ENV HDF5_VERSION 1.10.5
+#RUN wget -q https://support.hdfgroup.org/ftp/HDF5/current/src/hdf5-${HDF5_VERSION}.tar.gz \
+#    && tar -xzf hdf5-${HDF5_VERSION}.tar.gz \
+#    && cd hdf5-${HDF5_VERSION} \
+#    && mkdir install \
+#    && ./configure --prefix=/usr/local \
+##    && make check \
+#    && make install \
+#    && cd $WORKDIR && rm -rf hdf5-${HDF5_VERSION}.tar.gz hdf5-${HDF5_VERSION}
+
+
+# NOTE(bahmandar): netcdf  4.7.4 via apt install libnetcdf-dev
+#ENV NETCDF_VERSION 4.9.0
+#RUN wget -q https://downloads.unidata.ucar.edu/netcdf-c/${NETCDF_VERSION}/netcdf-c-${NETCDF_VERSION}.tar.gz \
+#    && tar -xzf netcdf-c-${NETCDF_VERSION}.tar.gz \
+#    && cd netcdf-c-${NETCDF_VERSION} \
+#    && mkdir install \
+#    && ./configure --prefix=/usr/local -disable-dap \
+##    && make check \
+#    && make install \
+#    && cd $WORKDIR && rm -rf netcdf-c-${NETCDF_VERSION}.tar.gz netcdf-c-${NETCDF_VERSION}
 
 ENV GDAL_VERSION 3.5.1
 RUN wget -q https://download.osgeo.org/gdal/${GDAL_VERSION}/gdal-${GDAL_VERSION}.tar.gz \
@@ -99,10 +112,8 @@ RUN wget -q https://download.osgeo.org/gdal/${GDAL_VERSION}/gdal-${GDAL_VERSION}
     -DGDAL_USE_GEOS=ON \
     -DGDAL_USE_TIFF_INTERNAL=ON \
     -DGDAL_USE_GEOTIFF_INTERNAL=ON \
-    -DGEOS_INCLUDE_DIR=/usr/local/include/ \
-    -DGEOS_LIBRARY=/usr/local/lib/ \
     && echo "building GDAL ${GDAL_VERSION}..." \
-    && cmake --build . && cmake --build . --target install \
+    && cmake --build . -j $(nproc) && cmake --build . --target install \
     && cd $WORKDIR && rm -rf gdal-${GDAL_VERSION}.tar.gz gdal-${GDAL_VERSION}
 
 RUN ldconfig

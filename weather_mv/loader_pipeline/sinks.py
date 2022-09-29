@@ -24,6 +24,8 @@ import os
 import io
 import apache_beam.io.gcp.gcsio
 import xarray
+import math
+import re
 
 from pyproj import Transformer
 import numpy as np
@@ -340,17 +342,6 @@ def uri_to_hash_file(uri: str, extension=None) -> str:
 class gcloudException(Exception):
     pass
 
-def log_subprocess_output(pipe):
-    for line in iter(pipe.readline, ''): # b'\n'-separated lines
-        line_output = line.strip()
-        if line_output:
-            logger.info(f'TTT {HOSTNAME}: subprocess: {line_output}')
-            # NOTE(bahmandar): A hash mismatch didn't put out an exit code != 0
-            # this is the reason for this check
-            if "ERROR" in line_output:
-                raise gcloudException(line_output)
-
-
 def delete_local_file(uri):
     if has_temp_dir():
         local_file_location = uri_to_filepath(uri, tempfile.gettempdir())
@@ -422,13 +413,26 @@ def copy_with_shutil(uri, dest_file):
   before_sleep=tenacity.before_sleep_log(logger, logging.INFO),
   after=tenacity.after_log(logger, logging.INFO),
   retry_error_callback=lambda retry_state: 1)
-def copy_with_gcloud(uri, dest_file):
+def copy_with_gcloud(uri, dest_file, source_file_size):
     try:
-        process = Popen(['gcloud', 'alpha', 'storage', 'cp', uri, dest_file.name], stdout=PIPE, stderr=STDOUT, universal_newlines=True)
-        with process.stdout:
-            log_subprocess_output(process.stdout)
-        exitcode = process.wait() # 0 means success
-        return exitcode
+        # NOTE(bahmandar): lower end speeds seen are 10-15 MiB/s
+        # using 1 MiB/s to calculate the expected timeout
+        expected_timeout = source_file_size / (1 * (1 << 20))
+        out = subprocess.run(['gcloud', 'alpha', 'storage', 'cp', uri, dest_file.name],
+                             shell=False,
+                             stdout=PIPE,
+                             stderr=STDOUT,
+                             text=True,
+                             timeout=expected_timeout)
+
+        output_lines_array = [line for line in out.stdout.split('\n') if line.strip() and not re.match(r'^[.]*$', line)]
+        line_output = '\n'.join(output_lines_array)
+        logger.info(f'TTT {HOSTNAME}: subprocess: {line_output}')
+        # NOTE(bahmandar): A hash mismatch didn't put out an exit code != 0
+        # this is the reason for this check
+        if "ERROR" in line_output:
+            raise gcloudException(line_output)
+        return out.returncode
     except OSError as e:
         logger.warning(e)
         # yield None
@@ -448,18 +452,15 @@ def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[
                     logger.warning(f'Short on Disk Space - Available: {convert_size(disk_space_available)} File: {convert_size(source_file_size)}')
                     yield None
                 else:
-
                     # NOTE(bahmandar): creates blank file to pre-allocate space
                     # one issue is that gcloud ran out of space while downloading the file
                     dest_file.truncate(source_file_size)
                     try:
-                        exit_code = copy_with_gcloud(uri, dest_file)
+                        exit_code = copy_with_gcloud(uri, dest_file, source_file_size)
                         if exit_code != 0:
-                            # with FileSystems().open(uri) as source_file:
                             copy_with_shutil(uri, dest_file)
                         dest_file.flush()
                         dest_file.seek(0)
-
                         t.name = f'TTT {HOSTNAME}: Created Local GCS File: {dest_file.name}'
                         t.stop()
                     except Exception:
@@ -469,10 +470,11 @@ def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[
                         accessed_time = os.stat(local_file_location).st_atime
                         os.utime(local_file_location, (accessed_time, modification_time))
                         yield dest_file.name
-                        file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
-                        file_erase.start()
+                        if pathlib.Path(local_file_location).is_file():
+                            file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
+                            file_erase.start()
                     except FileNotFoundError as e:
-                        logger.warning(f'{HOSTNAME}: {e} ')
+                        # logger.warning(f'{HOSTNAME}: {e} ')
                         yield None
         else:
             with FileSystems.open(local_file_location) as local_file:
@@ -658,6 +660,55 @@ def open_remote(uri: str) -> t.ContextManager[io.BufferedReader]:
         yield file
 
 
+def remove_unused_dimensions(ds: xarray.Dataset) -> xarray.Dataset:
+    dimensions_used = []
+    for vars in ds.keys():
+        dimensions_used += list(ds[vars].dims)
+    dimensions_used = set(dimensions_used)
+    for k in ds.sizes.keys():
+        if k not in dimensions_used:
+            ds = ds.drop_dims(k)
+    return ds
+
+
+# NOTE(bahmandar): In some cases like the Gebco dataset latitude values are in
+# the array are going more positive which means slice needs to be (s,n) instead
+# of (n,s)
+def filter_xr_dataset(ds: xarray.Dataset, area) -> xarray.Dataset:
+    n, w, s, e = area
+    if 'longitude' in ds:
+        longitude_name = 'longitude'
+        latitude_name = 'latitude'
+    elif 'lon' in ds:
+        longitude_name = 'lon'
+        latitude_name = 'lat'
+    else:
+        longitude_name = None
+        latitude_name = None
+    if longitude_name:
+        if ds[longitude_name].values[1] > ds[longitude_name].values[0]:
+            longitude_positive = e
+            longitude_negative = w
+        else:
+            longitude_positive = w
+            longitude_negative = e
+
+        if ds[latitude_name].values[1] > ds[latitude_name].values[0]:
+            latitude_positive = n
+            latitude_negative = s
+        else:
+            latitude_positive = s
+            latitude_negative = n
+        if 'longitude' in ds:
+            return ds.sel(latitude=slice(latitude_negative, latitude_positive), longitude=slice(longitude_negative, longitude_positive))
+        elif 'lon' in ds:
+            return ds.sel(lat=slice(latitude_negative, latitude_positive), lon=slice(longitude_negative, longitude_positive))
+        else:
+            return ds
+    else:
+        return ds
+
+
 @contextlib.contextmanager
 def open_dataset(uri,
                  open_dataset_kwargs: t.Optional[t.Dict] = None,
@@ -716,6 +767,12 @@ def open_dataset(uri,
                 t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
                 t.start()
                 xr_dataset: xr.Dataset = __open_dataset_file(uri_buffer, uri, uri_extension, disable_grib_schema_normalization, open_dataset_kwargs, backend_kwargs)
+
+                # NOTE(bahmandar): there was cased where dims were added but
+                # not used. this would make the num of elements huge for no
+                # reason
+                xr_dataset = remove_unused_dimensions(xr_dataset)
+
                 # NOTE(bahmandar): original size before filtering
                 original_size = xr_dataset.nbytes
                 t.name = f'TTT {HOSTNAME}: Opened Dataset: {pathlib.Path(uri).name}, {convert_size(xr_dataset.nbytes)}'
@@ -725,15 +782,10 @@ def open_dataset(uri,
 
                 if variables:
                     xr_dataset: xr.Dataset = _only_target_vars(xr_dataset, variables)
-
                 if area:
-                    n, w, s, e = area
-                    # print([coord.name for coord in (x, y, t)])
-                    if 'longitude' in xr_dataset:
-                        xr_dataset = xr_dataset.sel(latitude=slice(n, s), longitude=slice(w, e))
-                    elif 'lon' in xr_dataset:
-                        xr_dataset = xr_dataset.sel(lat=slice(n, s), lon=slice(w, e))
-                    logger.info(f'Data filtered by area, size: {convert_size(xr_dataset.nbytes)}')
+                    xr_dataset = filter_xr_dataset(xr_dataset, area)
+                    logger.info(f'Data filtered by area, size: {convert_size(xr_dataset.nbytes)} elements:{math.prod([v for k,v in xr_dataset.sizes.items()])}')
+
 
                 # NOTE(bahmandar): This is NOT TESTED and this will have to load everything into
                 # memory or have it available locally
