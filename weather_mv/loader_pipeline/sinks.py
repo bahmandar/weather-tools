@@ -767,6 +767,11 @@ def open_dataset(uri,
                 t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
                 t.start()
                 xr_dataset: xr.Dataset = __open_dataset_file(uri_buffer, uri, uri_extension, disable_grib_schema_normalization, open_dataset_kwargs, backend_kwargs)
+                if 'lon' in xr_dataset:
+                    xr_dataset = xr_dataset.rename({'lon': 'longitude'})
+                if 'lat' in xr_dataset:
+                    xr_dataset = xr_dataset.rename({'lat': 'latitude'})
+
 
                 # NOTE(bahmandar): there was cased where dims were added but
                 # not used. this would make the num of elements huge for no

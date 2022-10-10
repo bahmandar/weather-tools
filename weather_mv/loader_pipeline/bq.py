@@ -221,7 +221,7 @@ class ToBigQuery(ToDataSink):
             for schema_field in item.schema:
                 if schema_field.name not in item_schema_names:
                     schema_fields.append(schema_field)
-                    table_schema.append(bigquery.SchemaField(name=schema_field.name,field_type=schema_field.type,mode=schema_field.mode))
+                    table_schema.append(bigquery.SchemaField(name=schema_field.name,field_type=schema_field.type,mode=schema_field.mode, description=schema_field.description))
         if elements[0].dry_run:
             logger.debug('Created the BigQuery table with schema...')
             table = None
@@ -250,7 +250,7 @@ class ToBigQuery(ToDataSink):
                 user_email = get_user_email_from_credentials(credentials)
                 if user_email:
                     labels['user'] = clean_label_value(user_email)
-                labels['server_account_email'] = clean_label_value(client.get_service_account_email())
+                labels['service_account_email'] = clean_label_value(client.get_service_account_email())
 
 
 

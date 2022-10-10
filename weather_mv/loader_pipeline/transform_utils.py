@@ -122,6 +122,7 @@ def map_dtype_to_sql_type(var_type: numpy.dtype, da_item: t.Any) -> str:
     raise ValueError(f"Unknown mapping from '{var_type}' to SQL type")
 
 
+
 @Timer(name=f'TTT {HOSTNAME}: Inferred Schema From Data', text='{name}: {:.2f} seconds', logger=logger.info)
 def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery_beam.TableFieldSchema]:
     """Returns a BigQuery table schema able to store the data in 'ds'."""
@@ -133,15 +134,34 @@ def dataset_to_table_schema(ds: xr.Dataset) -> t.List[bigquery_beam.TableFieldSc
     #     for col in ds.variables.keys() if ds[col].size != 0
     # ]
 
+
+    dimensions = dict.fromkeys(ds.sizes, 0)
+    for col in ds.variables.keys():
+        for k, v in dimensions.items():
+            try:
+                index_position = ds[col].dims.index(k)
+                if index_position > v:
+                    dimensions[k] = index_position
+            except ValueError:
+                pass
+
+    # sometimes y and x are used instead of lat/lon
+    if 'y' in dimensions:
+        dimensions['latitude'] = dimensions.pop('y')
+    if 'x' in dimensions:
+        dimensions['longitude'] = dimensions.pop('x')
+    output_dimensions = [None] * len(dimensions)
+    for k, v in dimensions.items():
+        output_dimensions[v] = k
     columns = []
     for col in ds.variables.keys():
         if ds[col].size != 0:
             da_item = ds[col][tuple(0 for _ in range(len(ds[col].shape)))]
             columns.append((str(col), map_dtype_to_sql_type(ds[col].dtype, da_item)))
-    return to_table_schema(columns)
+    return to_table_schema(columns, repr(output_dimensions))
 
 # NOTE(bahmandar): Is FIRST_STEP needed?
-def to_table_schema(columns: t.List[t.Tuple[str, str]]) -> t.List[bigquery_beam.TableFieldSchema]:
+def to_table_schema(columns: t.List[t.Tuple[str, str]], dimensions: str) -> t.List[bigquery_beam.TableFieldSchema]:
     # Fields are all Nullable because data may have NANs. We treat these as null.
     fields = [
         bigquery_beam.TableFieldSchema(name=column, type=var_type, mode='NULLABLE')
@@ -149,7 +169,7 @@ def to_table_schema(columns: t.List[t.Tuple[str, str]]) -> t.List[bigquery_beam.
     ]
     # Add an extra columns for recording import metadata.
     fields.append(bigquery_beam.TableFieldSchema(name=DATA_IMPORT_TIME_COLUMN, type='TIMESTAMP', mode='NULLABLE'))
-    fields.append(bigquery_beam.TableFieldSchema(name=DATA_URI_COLUMN, type='STRING', mode='NULLABLE'))
+    fields.append(bigquery_beam.TableFieldSchema(name=DATA_URI_COLUMN, type='STRING', mode='NULLABLE', description=dimensions))
     # fields.append(bigquery.SchemaFieldbigquery_beam.TableFieldSchema(name=DATA_FIRST_STEP, type='TIMESTAMP', mode='NULLABLE'))
     fields.append(bigquery_beam.TableFieldSchema(name=GEO_POINT_COLUMN, type='GEOGRAPHY', mode='NULLABLE'))
     return fields
