@@ -15,12 +15,13 @@ RUN apt-get update -y \
     pkg-config flex bison libeccodes-dev libeccodes-tools metview=5.10.2-1 \
     metview-data=5.10.2-1 libmetview0d=5.10.2-1 libmetview-dev=5.10.2-1 sqlite3 \
     libgeos-dev libproj-dev libopenjp2-7 hdf5-tools libnetcdf-dev -y \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    && apt-get clean && rm -rf /var/lib/apt/lists/* && mkdir -p /usr/share/metview/share \
+    && ln -s /usr/share/metview/*  /usr/share/metview/share/ && ln -s /usr/lib/ /usr/share/metview/
 
 # Fixes the metview issue with debian
-RUN mkdir -p /usr/share/metview/share
-RUN ln -s /usr/share/metview/*  /usr/share/metview/share/
-RUN ln -s /usr/lib/ /usr/share/metview/
+#RUN mkdir -p /usr/share/metview/share
+#RUN ln -s /usr/share/metview/*  /usr/share/metview/share/
+#RUN ln -s /usr/lib/ /usr/share/metview/
 
 # NOTE(bahmandar): curl 7.74.0 is already installed on base image
 #ENV CURL_VERSION 7.83.1
@@ -114,9 +115,7 @@ RUN wget -q https://download.osgeo.org/gdal/${GDAL_VERSION}/gdal-${GDAL_VERSION}
     -DGDAL_USE_GEOTIFF_INTERNAL=ON \
     && echo "building GDAL ${GDAL_VERSION}..." \
     && cmake --build . -j $(nproc) && cmake --build . --target install \
-    && cd $WORKDIR && rm -rf gdal-${GDAL_VERSION}.tar.gz gdal-${GDAL_VERSION}
-
-RUN ldconfig
+    && cd $WORKDIR && rm -rf gdal-${GDAL_VERSION}.tar.gz gdal-${GDAL_VERSION} && ldconfig
 
 COPY requirements.txt ${WORKDIR}/requirements.txt
 
@@ -128,6 +127,4 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --force-reinstall apache-beam[gcp]==2.40.0
 
 #https://cloud.google.com/iap/docs/using-tcp-forwarding#increasing_the_tcp_upload_bandwidth
-RUN $(gcloud info --format="value(basic.python_location)") -m pip install numpy
-RUN gcloud components install --quiet alpha
-RUN gcloud components update --quiet --version=395.0.0
+RUN $(gcloud info --format="value(basic.python_location)") -m pip install numpy && gcloud components install --quiet alpha && gcloud components update --quiet --version=395.0.0

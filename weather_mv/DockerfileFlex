@@ -16,7 +16,6 @@ RUN find . -name "loader_pipeline*.tar.gz" -exec sh -c 'mv "$1" "loader_pipeline
 ENV FLEX_TEMPLATE_PYTHON_EXTRA_PACKAGES="${WORKDIR}/loader_pipeline.tar.gz"
 
 ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE="${WORKDIR}/setup.py"
-#ENV FLEX_TEMPLATE_PYTHON_SETUP_FILE=""
 
 
 ENV FLEX_TEMPLATE_PYTHON_PY_FILE="${WORKDIR}/weather-mv"

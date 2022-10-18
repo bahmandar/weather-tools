@@ -1,0 +1,9 @@
+*.*
+test_data/
+!requirements.txt
+!setup.py
+!weather-mv
+!loader_pipeline/*.py
+
+
+

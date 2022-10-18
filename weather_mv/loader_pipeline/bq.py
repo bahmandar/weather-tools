@@ -215,12 +215,14 @@ class ToBigQuery(ToDataSink):
         schema_fields = []
         elements = sets[1]
         attrs_list = []
+        column_names = []
         for item in elements:
             attrs_list.append(item.attrs)
             item_schema_names = [x.name for x in table_schema]
             for schema_field in item.schema:
                 if schema_field.name not in item_schema_names:
                     schema_fields.append(schema_field)
+                    column_names.append(schema_field.name)
                     table_schema.append(bigquery.SchemaField(name=schema_field.name,field_type=schema_field.type,mode=schema_field.mode, description=schema_field.description))
         if elements[0].dry_run:
             logger.debug('Created the BigQuery table with schema...')
@@ -233,6 +235,12 @@ class ToBigQuery(ToDataSink):
                 client = bigquery.Client()
                 table = bigquery.Table(self.output_table.replace(":", "."), schema=table_schema)
                 credentials = GoogleCredentials.get_application_default()
+                clustering_fields = []
+                if 'time' in column_names:
+                    clustering_fields.append('time')
+                if 'geometry' in column_names:
+                    clustering_fields.append('geometry')
+                table.clustering_fields = clustering_fields
                 table = client.create_table(table, exists_ok=True)
                 unique_attrs = [k for j, k in enumerate(attrs_list) if k not in attrs_list[j + 1:]]
                 unique_attrs_dict = {k: v for d in unique_attrs for k, v in d.items()}
@@ -251,8 +259,6 @@ class ToBigQuery(ToDataSink):
                 if user_email:
                     labels['user'] = clean_label_value(user_email)
                 labels['service_account_email'] = clean_label_value(client.get_service_account_email())
-
-
 
                 table.labels = labels
                 table = client.update_table(table, ["labels"])  # API request
