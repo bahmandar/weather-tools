@@ -238,8 +238,11 @@ class ToBigQuery(ToDataSink):
                 clustering_fields = []
                 if 'time' in column_names:
                     clustering_fields.append('time')
+                    table.time_partitioning = bigquery.table.TimePartitioning(field='time', type_=bigquery.table.TimePartitioningType.MONTH)
+
                 if 'geometry' in column_names:
                     clustering_fields.append('geometry')
+
                 table.clustering_fields = clustering_fields
                 table = client.create_table(table, exists_ok=True)
                 unique_attrs = [k for j, k in enumerate(attrs_list) if k not in attrs_list[j + 1:]]
