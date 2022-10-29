@@ -98,11 +98,8 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     # NOTE(bahmandar) first convert out of list before processing the rest
     if type(value) == np.ndarray:
         value = value.tolist()
-
     if type(value) == list:
         value = ','.join(map(str, value))
-
-
     if pd.isna(value):
         return None
     if np.issubdtype(type(value), np.floating):
@@ -144,6 +141,8 @@ def to_json_serializable_type(value: t.Any) -> t.Any:
     elif type(value) == np.timedelta64:
         # Return time delta in seconds.
         return float(value / np.timedelta64(1, 's'))
+    elif type(value) == datetime.timedelta:
+        return value.total_seconds()
     # This check must happen after processing np.timedelta64 and np.datetime64.
     elif np.issubdtype(type(value), np.integer):
         return int(value)

@@ -240,6 +240,29 @@ def __normalize_grib_dataset(filename: str) -> xr.Dataset:
     return xr.merge(_data_array_list)
 
 
+def compressed_file(filename):
+
+    # import pyfsig
+    # import json
+    # pyfsig.file_signatures.signatures = [i for i in pyfsig.file_signatures.signatures if (i['description'] not in ('PalmPilot Database/Document File', 'Palm Desktop Calendar Archive','Flexible Image Transport System (FITS)'))]
+
+    # pyfsig.file_signatures.signatures.pop('ascii')
+    # https://www.garykessler.net/library/file_sigs.html
+    magic_dict = {
+      "gz": b"\x1F\x8B\x08",
+      "bz2": b"\x42\x5a\x68",
+      "zip": b"\x50\x4b\x03\x04"
+    }
+    max_len = max(len(x) for x in magic_dict)
+    with FileSystems.open(filename, mime_type='application/octet-stream', compression_type=CompressionTypes.UNCOMPRESSED) as f:
+        file_start = f.read(max_len)
+    for filetype, magic in magic_dict.items():
+        if file_start.startswith(magic):
+            # return filetype
+            return True
+    return False
+
+
 def __open_dataset_file(
   filename: t.Union[str, t.BinaryIO],
   uri: str,
@@ -297,15 +320,36 @@ def __open_dataset_file(
 
     # NOTE(bahmandar): Runs twice to match the original function. better to remove if
     # not needed
-    for attempt in range(2):
+    for attempt in range(3):
         try:
+            if attempt == 1:
+                if not disable_grib_schema_normalization:
+                    # open with cfgrib.open_datasets
+                    logger.warning("Assuming grib.")
+                    # logger.info("Normalizing the grib schema, name of the data variables will look like "
+                    #             "'<level>_<height>_<attrs['GRIB_stepType']>_<key>'.")
+                    # NOTE(bahmandar): cfGrib can't handle file like so if it is file like
+                    # then read it into bytes. This will be a major memory hit for large
+                    # grib files
+                    if isinstance(filename, str):
+                        return _add_is_normalized_attr(__normalize_grib_dataset(filename), True)
+                    else:
+                        return _add_is_normalized_attr(__normalize_grib_dataset(filename.read()), True)
+                else:
+                    # NOTE(bahmandar): If disable_grib_schema_normalization is true and the file
+                    # is a grib file then open with cfgrib engine
+                    if cfgrib_backend.available:
+                        open_dataset_kwargs = {'engine': 'cfgrib'}
+                        backend_kwargs={'indexpath': ''}
             return _add_is_normalized_attr(xr.open_dataset(filename, backend_kwargs=backend_kwargs, **open_dataset_kwargs), False)
         # NOTE(bahmandar): saw datasetbuilderror
         except (ValueError, DatasetBuildError) as e:
             if "multiple values for key 'edition'" not in str(e):
-                raise
-            logger.warning("Assuming grib edition 1.")
-            backend_kwargs = {'filter_by_keys': {'edition': 1}, 'indexpath': ''}
+                if attempt > 2:
+                    raise
+            if attempt > 1:
+                logger.warning("Assuming grib edition 1.")
+                backend_kwargs = {'filter_by_keys': {'edition': 1}, 'indexpath': ''}
             continue
 
 
@@ -747,7 +791,7 @@ def open_dataset(uri,
                 # NOTE(bahmandar): try to local gcs save and if it fails then
                 # resort to remote open
                 if enable_local_save:
-                    if FileSystems.get_scheme(uri) == 'gs':
+                    if FileSystems.get_scheme(uri) == 'gs' and not compressed_file(uri):
                         uri_buffer = stack.enter_context(open_local_gcs(uri))
                         if uri_buffer is None:
                             uri_buffer = stack.enter_context(open_remote_gcs(uri))
