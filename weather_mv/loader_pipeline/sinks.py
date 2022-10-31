@@ -16,6 +16,7 @@ import abc
 import argparse
 import contextlib
 import dataclasses
+import glob
 import logging
 import shutil
 import tempfile
@@ -403,6 +404,9 @@ def delete_local_based_on_time(local_file_location, modification_time):
     if modification_time == os.stat(local_file_location).st_mtime:
         try:
             os.remove(local_file_location)
+            idx_file_paths = glob.glob(f'{local_file_location}*.idx')
+            for idx_file in idx_file_paths:
+                os.remove(idx_file)
         except FileNotFoundError:
             pass
 
@@ -439,15 +443,19 @@ def space_available(source_file_size=None):
 
 
 def get_uri_size(uri):
-    with FileSystems.open(uri) as remote_file:
-        return get_buffer_size(remote_file)
+    with FileSystems.open(uri, mime_type='application/octet-stream', compression_type=CompressionTypes.UNCOMPRESSED) as file:
+        return get_buffer_size(file)
 
 
-def copy_with_shutil(uri, dest_file):
-    with apache_beam.io.gcsio.GcsIO().open(filename=uri,
-                                           read_buffer_size=CUSTOM_READ_BUFFER_SIZE,
-                                           mode="rb", mime_type='application/octet-stream') as source_file:
-        shutil.copyfileobj(source_file, dest_file, CUSTOM_READ_BUFFER_SIZE)
+def copy_with_shutil(uri, dest_file, compressed=False):
+    if compressed:
+        with FileSystems().open(uri) as source_file:
+            shutil.copyfileobj(source_file, dest_file)
+    else:
+        with apache_beam.io.gcsio.GcsIO().open(filename=uri,
+                                               read_buffer_size=CUSTOM_READ_BUFFER_SIZE,
+                                               mode="rb", mime_type='application/octet-stream') as source_file:
+            shutil.copyfileobj(source_file, dest_file, CUSTOM_READ_BUFFER_SIZE)
 
 
 
@@ -485,63 +493,80 @@ def copy_with_gcloud(uri, dest_file, source_file_size):
 @contextlib.contextmanager
 def open_local_gcs(uri: str, ignore_existing: bool = False) -> t.ContextManager[t.Union[str, None]]:
     t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
-    t.start()
+    compressed = compressed_file(uri)
+    running = True
     if has_temp_dir():
-        local_file_location = uri_to_filepath(uri, tempfile.gettempdir())
-        if not FileSystems.exists(local_file_location) or ignore_existing:
-            with FileSystems.create(local_file_location) as dest_file:
-                source_file_size = get_uri_size(uri)
-                if not space_available(source_file_size=source_file_size):
-                    disk_space_available = get_system_free_size()
-                    logger.warning(f'Short on Disk Space - Available: {convert_size(disk_space_available)} File: {convert_size(source_file_size)}')
-                    yield None
-                else:
-                    # NOTE(bahmandar): creates blank file to pre-allocate space
-                    # one issue is that gcloud ran out of space while downloading the file
-                    dest_file.truncate(source_file_size)
-                    try:
-                        exit_code = copy_with_gcloud(uri, dest_file, source_file_size)
-                        if exit_code != 0:
-                            copy_with_shutil(uri, dest_file)
-                        dest_file.flush()
-                        dest_file.seek(0)
-                        t.name = f'TTT {HOSTNAME}: Created Local GCS File: {dest_file.name}'
-                        t.stop()
-                    except Exception:
+        while running:
+            t.start()
+            local_file_location = uri_to_filepath(uri, tempfile.gettempdir())
+            if not FileSystems.exists(local_file_location) or ignore_existing:
+                running = False
+                with FileSystems.create(local_file_location, compression_type=CompressionTypes.UNCOMPRESSED) as dest_file:
+                    source_file_size = get_uri_size(uri)
+                    if not space_available(source_file_size=source_file_size):
+                        disk_space_available = get_system_free_size()
+                        logger.warning(f'Short on Disk Space - Available: {convert_size(disk_space_available)} File: {convert_size(source_file_size)}')
                         yield None
-                    try:
-                        modification_time = time.time()
-                        accessed_time = os.stat(local_file_location).st_atime
-                        os.utime(local_file_location, (accessed_time, modification_time))
-                        yield dest_file.name
-                        if pathlib.Path(local_file_location).is_file():
+                    else:
+                        # NOTE(bahmandar): creates blank file to pre-allocate space
+                        # one issue is that gcloud ran out of space while downloading the file
+                        if not compressed:
+                            dest_file.truncate(source_file_size)
+                        try:
+                            if not compressed:
+                                exit_code = copy_with_gcloud(uri, dest_file, source_file_size)
+                            else:
+                                exit_code = 1
+                            if exit_code != 0:
+                                copy_with_shutil(uri, dest_file, compressed)
+                            dest_file.flush()
+                            dest_file.seek(0)
+                            t.name = f'TTT {HOSTNAME}: Created Local GCS File: {dest_file.name}'
+                            t.stop()
+                        except Exception as e:
+                            logger.error(f'{HOSTNAME}: {e} ')
+                            yield None
+                        try:
+                            modification_time = time.time()
+                            accessed_time = os.stat(local_file_location).st_atime
+                            os.utime(local_file_location, (accessed_time, modification_time))
+
+                            # updated any idx files
+                            idx_file_paths = glob.glob(f'{local_file_location}*.idx')
+                            for idx_file in idx_file_paths:
+                                os.utime(idx_file, (accessed_time, modification_time))
+                            yield dest_file.name
+                            if pathlib.Path(local_file_location).is_file():
+                                file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
+                                file_erase.start()
+                        except FileNotFoundError as e:
+                            # logger.warning(f'{HOSTNAME}: {e} ')
+                            yield None
+            else:
+                with FileSystems.open(local_file_location) as local_file:
+                    with FileSystems.open(uri) as remote_file:
+                        if get_uri_size(local_file_location) == get_uri_size(uri):
+                            t.name = f'TTT {HOSTNAME}: Reused Local GCS File: {local_file_location}'
+                            t.stop()
+                            modification_time = time.time()
+                            accessed_time = os.stat(local_file_location).st_atime
+                            # NOTE(bahmandar): changes modification time. Didn't find
+                            # any good way to share this fail between threads and workers
+                            # they were re-downloading again which I wanted to stop
+                            os.utime(local_file_location, (accessed_time, modification_time))
+                            idx_file_paths = glob.glob(f'{local_file_location}*.idx')
+                            for idx_file in idx_file_paths:
+                                os.utime(idx_file, (accessed_time, modification_time))
+                            yield local_file_location
+                            # NOTE(bahmandar): If no other thread/process picks this up
+                            # it will be deleted in 60 seconds
                             file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
                             file_erase.start()
-                    except FileNotFoundError as e:
-                        # logger.warning(f'{HOSTNAME}: {e} ')
-                        yield None
-        else:
-            with FileSystems.open(local_file_location) as local_file:
-                with FileSystems.open(uri) as remote_file:
-                    if get_buffer_size(local_file) == get_buffer_size(remote_file):
-                        t.name = f'TTT {HOSTNAME}: Reused Local GCS File: {local_file_location}'
-                        t.stop()
-                        modification_time = time.time()
-                        accessed_time = os.stat(local_file_location).st_atime
-                        # NOTE(bahmandar): changes modification time. Didn't find
-                        # any good way to share this fail between threads and workers
-                        # they were re-downloading again which I wanted to stop
-                        os.utime(local_file_location, (accessed_time, modification_time))
-                        yield local_file_location
-                        # NOTE(bahmandar): If no other thread/process picks this up
-                        # it will be deleted in 60 seconds
-                        file_erase = threading.Timer(60, delete_local_based_on_time, (local_file_location, modification_time))
-                        file_erase.start()
-                    else:
-                        # NOTES(bahmandar): Need to test this out again. UNTESTED
-                        t.name = f'TTT {HOSTNAME}: Deleted Corrupted File: {local_file_location}'
-                        t.stop()
-                        yield open_local_gcs(uri, True)
+                        else:
+                            t.name = f'TTT {HOSTNAME}: Deleted Corrupted File: {local_file_location}'
+                            t.stop()
+                            ignore_existing = True
+
 
     else:
         yield None
@@ -555,6 +580,7 @@ def open_local(uri: str) -> t.ContextManager[str]:
     """Copy a cloud object (e.g. a netcdf, grib, or tif file) from cloud storage, like GCS, to local file."""
     t = Timer(name='', text='{name}: {:.2f} seconds', logger=logger.info)
     t.start()
+    # local_file_location = uri_to_filepath(uri, tempfile.gettempdir())
     with FileSystems().open(uri) as source_file:
         # with tempfile.TemporaryDirectory() as temp_dir:
         with tempfile.NamedTemporaryFile() as local_file_location:
@@ -791,7 +817,7 @@ def open_dataset(uri,
                 # NOTE(bahmandar): try to local gcs save and if it fails then
                 # resort to remote open
                 if enable_local_save:
-                    if FileSystems.get_scheme(uri) == 'gs' and not compressed_file(uri):
+                    if FileSystems.get_scheme(uri) == 'gs':
                         uri_buffer = stack.enter_context(open_local_gcs(uri))
                         if uri_buffer is None:
                             uri_buffer = stack.enter_context(open_remote_gcs(uri))

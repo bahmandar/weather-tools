@@ -208,6 +208,28 @@ class ToBigQuery(ToDataSink):
                             region=pipeline_options_dict.get('region'))
             logger.info('Region validation completed successfully.')
 
+    def get_additional_bq_parameters(self, table_id):
+        client = bigquery.Client()
+        additional_bq_parameters = {
+            'schemaUpdateOptions': [
+                'ALLOW_FIELD_ADDITION',
+                # 'ALLOW_FIELD_RELAXATION',
+            ]
+        }
+
+        table = client.get_table(table_id.replace(':','.'))  # Make an API request.
+        if clustering := table.clustering_fields:
+            additional_bq_parameters['clustering'] = {'fields': clustering}
+        if time_partition := table.time_partitioning:
+            additional_bq_parameters['timePartitioning'] = {'field': time_partition.field}
+
+        if partition_type := table.partitioning_type:
+            additional_bq_parameters['timePartitioning']['type'] = partition_type
+
+        return additional_bq_parameters
+
+
+
     # NOTE(bahmandar): This will process all the schemas received from different
     # files
     def get_schema(self, sets):
@@ -397,12 +419,10 @@ class ToBigQuery(ToDataSink):
                         method=WriteToBigQuery.Method.FILE_LOADS,
                         write_disposition=BigQueryDisposition.WRITE_APPEND,
                         create_disposition=BigQueryDisposition.CREATE_IF_NEEDED,
-                        additional_bq_parameters={
-                            'schemaUpdateOptions': [
-                                'ALLOW_FIELD_ADDITION',
-                                # 'ALLOW_FIELD_RELAXATION',
-                            ]
-                        })
+                        additional_bq_parameters=self.get_additional_bq_parameters
+
+
+              )
             )
         else:
             pass
