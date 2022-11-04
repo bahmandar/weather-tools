@@ -70,6 +70,12 @@
       "helpText": "A Pub/Sub topic for GCS OBJECT_FINALIZE events, or equivalent, of a cloud bucket. E.g. 'projects/<PROJECT_ID>/topics/<TOPIC_ID>'.",
       "label": "Topic",
       "isOptional": true
+    },
+    {
+      "name": "disable_grib_schema_normalization",
+      "helpText": "To disable using cfgrib and the normalization",
+      "label": "Disable Grib Schema Normalization",
+      "isOptional": true
     }
   ]
 }
