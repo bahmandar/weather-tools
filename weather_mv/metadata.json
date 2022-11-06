@@ -76,7 +76,15 @@
       "helpText": "To disable using cfgrib and the normalization",
       "label": "Disable Grib Schema Normalization",
       "isOptional": true
+    },
+    {
+      "name": "number_of_worker_harness_threads",
+      "helpText": "Number of threads per worker to use on the runner",
+      "label": "Number of Worker Harness Threads",
+      "isOptional": true
     }
+
+
   ]
 }
 
